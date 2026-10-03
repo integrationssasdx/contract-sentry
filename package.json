@@ -1,0 +1,13 @@
+{
+  "name": "contract-sentry",
+  "version": "0.1.0",
+  "description": "Solidity static audit engine: dangerous-pattern detection, reachability and locatable reports",
+  "type": "module",
+  "bin": {
+    "contract-sentry": "bin/contract-sentry.js"
+  },
+  "scripts": {
+    "test": "node tests/run-tests.js"
+  },
+  "license": "MIT"
+}
