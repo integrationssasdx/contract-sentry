@@ -206,11 +206,26 @@ contract Reentry {
   assert(r.code === 0, `state: exit 0 (got ${r.code})`);
   const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
   const lines = hits.map((h) => h.location.startLine).sort((a, b) => a - b);
-  // Fixture line 1 is blank: bad write(8), transferThenWrite total+=1 (16).
-  assert(lines.join(',') === '8,16', `state: expected 8,16 got ${lines}`);
+  // Fixture line 1 is blank: bad write(8), transferThenWrite total+=1 (16),
+  // internalOnly write(20) reported but unreachable.
+  assert(lines.join(',') === '8,16,20', `state: expected 8,16,20 got ${lines}`);
   assert(hits.every((h) => h.severity === 'high'), 'state: severity high');
-  // internalOnly must not be an entry finding for the state rule,
-  // but its call() is still an unchecked call, reachable=false.
+  const reachableLines = hits.filter((h) => h.reachable).map((h) => h.location.startLine);
+  assert(reachableLines.join(',') === '8,16',
+    `state: only entry-rooted findings are reachable, got ${reachableLines}`);
+  // internalOnly: ordering violation exists but no entry reaches it.
+  const internalState = hits.find((h) => h.location.startLine === 20);
+  assert(internalState && internalState.reachable === false,
+    'state: internal helper write reachable=false');
+  assert(internalState.evidence.entryPoints.length === 0,
+    'state: unreachable entryPoints empty');
+  assert(internalState.evidence.callChain.length === 0,
+    'state: unreachable callChain empty');
+  assert(internalState.evidence.interaction.callChain.length === 0,
+    'state: unreachable interaction.callChain empty');
+  assert(internalState.evidence.interaction.location.startLine === 19,
+    'state: unreachable interaction.location retained');
+  // internalOnly's call() is still an unchecked call, reachable=false.
   const internalUnchecked = rules(r.json.findings, 'UNCHECKED_EXTERNAL_CALL')
     .find((f) => f.location.startLine === 19);
   assert(internalUnchecked && internalUnchecked.reachable === false,
@@ -461,11 +476,217 @@ library L { function g(address a) internal { a.call(""); } }
   sb.remove();
 }
 
+function testCrossFunctionRelay() {
+  const sb = makeSandbox();
+  sb.write('relay.sol', `
+pragma solidity ^0.8.0;
+contract C {
+    uint256 x;
+    // interaction in entry, write in callee (caller -> callee relay)
+    function callerRelay(address a) public {
+        a.call("");
+        doWrite();
+    }
+    // interaction in callee, write in callee (entry -> multi-level -> leaf)
+    function chainEntry(address a) public {
+        l1(a);
+    }
+    function l1(address a) internal { l2(a); }
+    function l2(address a) internal {
+        a.call("");
+        x = 2;
+    }
+    function doWrite() internal {
+        x = 1;
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'relay.sol'));
+  assert(r.code === 0, `relay: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  assert(hits.length === 2, `relay: 2 findings got ${hits.length}`);
+
+  // Fixture line 1 is blank: doWrite body x=1 is line 20, l2 write x=2 line 17.
+  const callerWrite = hits.find((h) => h.location.startLine === 20);
+  assert(!!callerWrite, 'relay: caller-interaction witnesses callee write');
+  assert(callerWrite.evidence.callChain.map((c) => c.name).join('->') ===
+    'callerRelay->doWrite', 'relay: callChain entry->doWrite');
+  assert(callerWrite.evidence.interaction.location.startLine === 7,
+    'relay: interaction at entry call line 7');
+  assert(callerWrite.evidence.interaction.callChain.map((c) => c.name).join('->') ===
+    'callerRelay', 'relay: interaction chain stops at entry');
+
+  const chainWrite = hits.find((h) => h.location.startLine === 17);
+  assert(!!chainWrite, 'relay: multi-level internal call chain detected');
+  assert(chainWrite.evidence.callChain.map((c) => c.name).join('->') ===
+    'chainEntry->l1->l2', 'relay: multi-level callChain');
+  assert(chainWrite.evidence.interaction.callChain.map((c) => c.name).join('->') ===
+    'chainEntry->l1->l2', 'relay: interaction chain through to leaf');
+  sb.remove();
+}
+
+function testPathSensitiveBranches() {
+  const sb = makeSandbox();
+  sb.write('paths.sol', `
+pragma solidity ^0.8.0;
+interface IT { function f() external; }
+contract C {
+    uint256 x;
+    function mutex(address a, bool b) public {
+        if (b) { x = 1; } else { a.call(""); }
+    }
+    function sameBranch(address a, bool b) public {
+        if (b) { a.call(""); x = 2; }
+    }
+    function loopCase(address a) public {
+        for (uint256 i = 0; i < 2; i++) {
+            if (i == 0) { a.call(""); }
+            if (i == 1) { x = 3; }
+        }
+    }
+    function tryCatch() public {
+        try IT(address(0)).f() {
+            x = 4;
+        } catch {
+            x = 5;
+        }
+    }
+    function earlyReturn(address a, bool b) public {
+        a.call("");
+        if (b) { return; }
+        x = 6;
+    }
+    function writeBefore(address a) public {
+        x = 7;
+        a.call("");
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'paths.sol'));
+  assert(r.code === 0, `paths: exit 0 (got ${r.code} ${r.stdout})`);
+  const lines = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL')
+    .map((h) => h.location.startLine).sort((a, b) => a - b);
+  // Reported: sameBranch(10), loop later-iteration write(15), try body(20),
+  // catch body(22), post-return fall-through(28).
+  // Excluded: mutex write(7, exclusive else-branch interaction) and
+  // writeBefore(31, store precedes the interaction).
+  assert(lines.join(',') === '10,15,20,22,28',
+    `paths: path-sensitive lines 10,15,20,22,28 got ${lines}`);
+  sb.remove();
+}
+
+function testWitnessSelectionAndEntries() {
+  const sb = makeSandbox();
+  sb.write('wit.sol', `
+pragma solidity ^0.8.0;
+contract C {
+    uint256 x;
+    function direct(address a) public {
+        a.call("");
+        shared();
+    }
+    function viaMiddle(address a) public {
+        middle(a);
+    }
+    function middle(address a) internal {
+        a.call("");
+        shared();
+    }
+    function shared() internal { x = 1; }
+}
+`);
+  const r = run(path.join(sb.dir, 'wit.sol'));
+  assert(r.code === 0, `witness: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  // Same write location (line 14) across two entries: one finding only.
+  assert(hits.length === 1, `witness: one finding per source location got ${hits.length}`);
+  const f = hits[0];
+  const entries = f.evidence.entryPoints.map((e) => e.name).sort().join(',');
+  assert(entries === 'direct,viaMiddle', `witness: both entries collected got ${entries}`);
+  // Winning witness: direct (fewer function levels).
+  assert(f.evidence.interaction.callChain.map((c) => c.name).join('->') === 'direct',
+    'witness: fewest function levels wins');
+  assert(f.evidence.callChain.map((c) => c.name).join('->') === 'direct->shared',
+    'witness: callChain follows winning entry to write function');
+  sb.remove();
+}
+
+function testFreeAndConstructorChain() {
+  const sb = makeSandbox();
+  sb.write('fc.sol', `
+pragma solidity ^0.8.0;
+contract Base {
+    constructor(address a) { a.call(""); }
+}
+contract C is Base {
+    uint256 x;
+    constructor(address a) Base(a) {
+        x = 1;
+    }
+    function viaFree(address a) public {
+        a.call("");
+        freeEffect();
+    }
+}
+function freeEffect() { x = 2; }
+`);
+  const r = run(path.join(sb.dir, 'fc.sol'));
+  assert(r.code === 0, `free/ctor: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  // Blank line 1: derived ctor x=1 (9), free fn x=2 (16).
+  const byLine = Object.fromEntries(hits.map((h) => [h.location.startLine, h]));
+  const ctor = byLine[9];
+  assert(!!ctor && ctor.reachable, 'free/ctor: base constructor interaction witnesses derived write');
+  assert(ctor.evidence.entryPoints[0].kind === 'constructor', 'free/ctor: entry is constructor');
+  assert(ctor.evidence.interaction.callChain.length === 2,
+    'free/ctor: interaction chain reaches into base constructor');
+  const free = byLine[16];
+  assert(!!free && free.reachable, 'free/ctor: free function write detected');
+  assert(free.evidence.callChain.map((c) => `${c.contract || ''}:${c.name}`).join('->') ===
+    'C:viaFree->:freeEffect', 'free/ctor: callChain includes free function');
+  sb.remove();
+}
+
+function testInheritanceDedup() {
+  const sb = makeSandbox();
+  sb.write('dedup.sol', `
+pragma solidity ^0.8.0;
+contract Parent {
+    uint256 p;
+    function work(address a) public {
+        a.call("");
+        p = 1;
+    }
+}
+contract Child is Parent {
+    function other(address a) public {
+        work(a);
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'dedup.sol'));
+  assert(r.code === 0, `dedup: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  // Blank line 1: Parent.work write is line 7. Visited from Parent's own
+  // view and Child's inherited view, but reported exactly once.
+  assert(hits.length === 1 && hits[0].location.startLine === 7,
+    `dedup: same inherited source location reported once, got ${hits.map((h) => h.location.startLine)}`);
+  const entries = hits[0].evidence.entryPoints.map((e) => `${e.contract}.${e.name}`).sort();
+  assert(entries.join(',') === 'Child.other,Parent.work',
+    `dedup: entries across inherited views collected, got ${entries}`);
+  sb.remove();
+}
+
 const tests = [
   testCleanContract,
   testDelegatecall,
   testUncheckedCallVariants,
   testStateUpdate,
+  testCrossFunctionRelay,
+  testPathSensitiveBranches,
+  testWitnessSelectionAndEntries,
+  testFreeAndConstructorChain,
+  testInheritanceDedup,
   testReachabilityChain,
   testInheritanceOverride,
   testConstructorEntry,

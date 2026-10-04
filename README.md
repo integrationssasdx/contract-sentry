@@ -44,20 +44,40 @@ node bin/contract-sentry.js audit <path>
         "callChain": [
           { "file": "contracts/Wallet.sol", "contract": "Wallet",
             "name": "fallback", "kind": "fallback" }
-        ]
+        ],
+        "interaction": {
+          "location": {
+            "file": "contracts/Wallet.sol",
+            "startLine": 22,
+            "startColumn": 9,
+            "endLine": 22,
+            "endColumn": 20
+          },
+          "callChain": [
+            { "file": "contracts/Wallet.sol", "contract": "Wallet",
+              "name": "fallback", "kind": "fallback" }
+          ]
+        }
       }
     }
   ]
 }
 ```
 
+> `interaction` 仅出现在 `STATE_UPDATE_AFTER_CALL` 的 evidence 中。
+
 - `files`：实际纳入分析的文件，按相对路径排序；目录入参形如
   `<目录名>/子路径/文件.sol`。
 - `findings`：按文件相对路径、出现位置排序。无风险时为空数组。
-- 行、列号均从 1 开始，`location` 覆盖危险操作本身（如 `target.call`）。
+- 行、列号均从 1 开始，`location` 覆盖危险操作本身（如 `target.call`）；
+  对 `STATE_UPDATE_AFTER_CALL` 覆盖状态写入位置，见证顺序的外部交互见
+  `evidence.interaction.location`。
 - `severity` 只可能是 `high` 或 `medium`。
-- `reachable=false` 时 `evidence.entryPoints` 与 `evidence.callChain` 均为
-  空数组。
+- `STATE_UPDATE_AFTER_CALL` 的 `callChain` 是入口到写状态函数的最短链，
+  `interaction.callChain` 是入口到外部交互函数的最短链（两者可不同）。
+- `reachable=false` 时 `evidence.entryPoints`、`evidence.callChain` 与
+  `evidence.interaction.callChain` 均为空数组；`interaction.location`
+  仍然保留。
 
 ### 规则
 
@@ -65,7 +85,7 @@ node bin/contract-sentry.js audit <path>
 | --- | --- | --- |
 | `DELEGATECALL_UNTRUSTED_TARGET` | high | `delegatecall` 的目标受函数参数、calldata、`msg.sender`、`tx.origin` 或可控存储值影响 |
 | `UNCHECKED_EXTERNAL_CALL` | medium | `call`、`staticcall`、`send`、`transfer` 的结果未在同函数后续控制流中检查 |
-| `STATE_UPDATE_AFTER_CALL` | high | 公开入口在外部调用或转账之后写入重入敏感状态 |
+| `STATE_UPDATE_AFTER_CALL` | high | 同一条静态可解析路径上，外部调用或转账先发生、重入敏感状态后被写入 |
 
 ### 入口与可达性
 
@@ -75,6 +95,17 @@ node bin/contract-sentry.js audit <path>
   调用链跨继承解析，`override` 取最终声明版本；`evidence.callChain`
   给出入口到危险操作所在函数的最短调用链。
 - 修饰器（modifier）按其在函数上的声明顺序内联展开（`_;` 为函数体位置）。
+- `STATE_UPDATE_AFTER_CALL` 的顺序按控制流判定：
+  - 从公开入口沿继承解析后的内部调用、自由函数、构造函数链与展开的
+    modifier 跨函数接力，调用者与被调函数双向、多层内部调用均识别；
+  - `if`/`else`、循环、`try`/`catch` 与 `return` 只在先交互后写入位于
+    同一路径时报告，互斥分支不拼接；循环较早迭代的交互可为较后迭代的
+    写入作见证；
+  - 同一写入有多个见证时，取经过函数层数最少者，层数相同按入口与位置
+    取第一个；每个源位置只保留一个 finding，同一源位置跨继承视图只报
+    一次，`entryPoints` 收集所有可触发入口。
+  - 即使没有任何入口可达（如纯 internal 辅助函数），顺序违例仍以
+    `reachable=false` 报告。
 
 ### 退出码与错误对象
 

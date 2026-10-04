@@ -788,6 +788,19 @@ function varChecked(stmt, name) {
 }
 
 // ---- rule 3: state update after external interaction -----------------------
+//
+// Interprocedural, path-sensitive ordering. A root (an entry function, or
+// any function with a body as a local root for reachable=false reporting)
+// is expanded along:
+//   - statically resolved internal calls (bare identifiers, super.x),
+//   - free functions,
+//   - linearized base constructors (which run before the derived body),
+//   - modifiers, already inlined by effectiveStatements().
+//
+// Branching (if/else, loops, try/catch, return, ternary) is modelled with
+// cloned path states so mutually exclusive branches are never stitched;
+// loop bodies run to a fixed point so an interaction from an earlier
+// iteration can witness a write in a later one.
 
 function isExternalInteraction(view, n) {
   if (n.kind !== 'call') return false;
@@ -833,58 +846,349 @@ function stateWriteRoot(view, expr) {
   return null;
 }
 
-function runStateUpdateRule(view, desc, wrapped, isEntry) {
-  if (!isEntry || !desc.node.body) return [];
-  const findings = [];
-  const steps = linearSteps(wrapped);
-  let interactionBefore = false;
-  let fired = false;
+const nodeLabel = (d) => `${d.file || ''}::${d.contract || ''}:${d.kind}:${d.name}`;
+const entryLabel = (d) => `${d.contract || ''}:${d.kind}:${d.name}`;
+const chainKey = (chain) => chain.map(nodeLabel).join('>');
 
-  for (const { stmt, origin } of steps) {
-    const exprs = statementExpressions(stmt);
-    if (stmt.kind === 'tryCall') exprs.push(stmt.expr);
-
-    // External interactions textually present in this step.
-    let hasInteraction = false;
-    for (const expr of exprs) {
-      walkExpr(expr, (n) => {
-        if (isExternalInteraction(view, n)) hasInteraction = true;
-      });
-    }
-
-    // Any storage store in this statement executes only after every
-    // expression (including external calls) has been evaluated, so a write
-    // in a statement containing an interaction is always post-call.
-    if ((interactionBefore || hasInteraction) && !fired) {
-      walkStatement(stmt, (st) => {
-        if (fired) return;
-        let writes = [];
-        if (st.kind === 'expression' && st.expr) {
-          const e = st.expr;
-          if (e.kind === 'assign') writes = [[e.target.loc, e.target]];
-          else if (e.kind === 'unary' && (e.op === '++' || e.op === '--' || e.op === 'delete')) {
-            writes = [[e.operand.loc, e.operand]];
-          }
-        }
-        for (const [loc, target] of writes) {
-          const sv = stateWriteRoot(view, target);
-          if (sv) {
-            fired = true;
-            findings.push({
-              ruleId: 'STATE_UPDATE_AFTER_CALL',
-              origin: origin || desc,
-              location: loc,
-              stateVar: sv.name,
-            });
-            break;
-          }
-        }
-      });
-    }
-
-    if (hasInteraction) interactionBefore = true;
+// State travelling along one or more merged execution paths: the set of
+// external interactions already witnessed. null means the path terminates
+// (return/revert) and carries no state to subsequent statements.
+class PState {
+  constructor() { this.witnesses = new Set(); }
+  clone() {
+    const s = new PState();
+    for (const w of this.witnesses) s.witnesses.add(w);
+    return s;
   }
-  return findings;
+  static union(states) {
+    const live = states.filter((s) => s !== null && s !== undefined);
+    if (!live.length) return null;
+    const out = new PState();
+    for (const s of live) for (const w of s.witnesses) out.witnesses.add(w);
+    return out;
+  }
+  signature() {
+    return [...this.witnesses]
+      .map((w) => `${w.level}:${w.entry ? entryLabel(w.entry) : '@'}:${w.pos}`)
+      .sort().join('|');
+  }
+}
+
+// Statically resolvable internal dispatch at a call expression.
+function internalCallTargets(view, callNode, callerDesc) {
+  const out = [];
+  const callee = callNode.callee;
+  const argc = (callNode.args || []).length;
+  if (callee.kind === 'ident') {
+    if (BUILTIN_CALLS.has(callee.name)) return out;
+    const t = view.resolveMethod(callee.name, argc);
+    if (t) out.push(t);
+  } else if (callee.kind === 'member' && callee.object.kind === 'ident' &&
+             callee.object.name === 'super') {
+    let started = false;
+    for (const { file, contract } of view.linearized) {
+      if (!started) { if (contract.name === callerDesc.contract) started = true; continue; }
+      const t = findMethodInContract(view, contract, file, callee.property, argc);
+      if (t) out.push(t);
+    }
+  }
+  return out;
+}
+
+// Span covering the external interaction: `<target>.<method>` for low-level
+// calls, otherwise the callee itself (`token.f`, `new Token`, ...).
+function interactionSpan(node) {
+  if (isLowLevelCall(node, ALL_LOW_LEVEL)) return operationSpan(node);
+  return node.callee.loc;
+}
+
+function runStateUpdateRuleView(view) {
+  const records = [];
+
+  const analyzeRoot = (rootDesc, rootEntry) => {
+    const seen = new Set();
+    const sink = (rec) => {
+      const k = [
+        `${rec.file}:${rec.loc.startOffset}:${rec.loc.endOffset}`,
+        rec.reachable ? entryLabel(rec.entry) : '@',
+        rec.wPos,
+        chainKey(rec.chainI),
+        chainKey(rec.chainW),
+      ].join('|');
+      if (!seen.has(k)) { seen.add(k); records.push(rec); }
+    };
+    const env = {
+      view, rootEntry, sink,
+      chain: [rootDesc],
+      stack: new Set([descKey(rootDesc)]),
+      origin: rootDesc,
+    };
+    traverseCallable(rootDesc, new PState(), env);
+  };
+
+  // Local roots: every implementation in the view, including free
+  // functions, so ordering violations unreachable from any entry are
+  // still reported with reachable=false.
+  for (const m of view.methods.values()) {
+    if (m.node && m.node.body) analyzeRoot(m, null);
+  }
+  for (const f of view.freeFunctions.values()) {
+    if (f.node && f.node.body) analyzeRoot(f, null);
+  }
+  // Entry roots: witnesses produced here are reachable.
+  for (const e of view.entries) {
+    if (e.node && e.node.body) analyzeRoot(e, e);
+  }
+  return records;
+}
+
+// Expand a callee in the current state. A callee always returns control to
+// the caller (even via `return`), so witnessed interactions merge back
+// regardless of how the callee path ended.
+function expandInternal(target, state, env) {
+  if (env.stack.has(descKey(target))) return state;
+  const innerEnv = {
+    ...env,
+    chain: [...env.chain, target],
+    stack: new Set([...env.stack, descKey(target)]),
+    origin: target,
+  };
+  const work = state.clone();
+  traverseCallable(target, work, innerEnv);
+  return PState.union([state, work]);
+}
+
+// Base constructors (in execution order) then the descriptor's own body.
+function traverseCallable(desc, state, env) {
+  if (state === null) return null;
+  if (desc.kind === 'constructor') {
+    // Linearization is most-derived-first: actual base constructors are the
+    // entries after this descriptor's own contract; reversed they run in
+    // most-base-first execution order.
+    const at = env.view.linearized.findIndex(
+      ({ contract }) => contract.name === desc.contract);
+    const ancestors = at >= 0 ? env.view.linearized.slice(at + 1) : [];
+    const bases = [];
+    for (const { file, contract } of [...ancestors].reverse()) {
+      const node = (contract.nodes || []).find((n) => n.functionKind === 'constructor');
+      if (node) {
+        bases.push({ ...descriptorFor(node, file, contract.name, (node.params || []).length), node });
+      }
+    }
+    for (const base of bases) {
+      if (env.stack.has(descKey(base))) continue;
+      const innerEnv = {
+        ...env,
+        chain: [...env.chain, base],
+        stack: new Set([...env.stack, descKey(base)]),
+        origin: base,
+      };
+      state = traverseSeq(env.view.effectiveStatements(base), state, innerEnv);
+      if (state === null) return null;
+    }
+  }
+  return traverseSeq(env.view.effectiveStatements(desc), state, env);
+}
+
+function traverseSeq(wrapped, state, env) {
+  for (const { stmt, origin } of wrapped) {
+    state = traverseStmt(stmt, state, { ...env, origin });
+    if (state === null) return null;
+  }
+  return state;
+}
+
+function loopFixpoint(state, round) {
+  let prev = null;
+  for (let i = 0; i < 32; i++) {
+    const sig = state.signature();
+    if (sig === prev) break;
+    prev = sig;
+    const work = state.clone();
+    const r = round(work);
+    state = PState.union([state, r || work]);
+  }
+  return state;
+}
+
+function traverseStmt(stmt, state, env) {
+  if (state === null) return null;
+  if (!stmt) return state;
+  switch (stmt.kind) {
+    case 'block':
+      return traverseSeq(
+        (stmt.statements || []).map((s) => ({ stmt: s, origin: env.origin })),
+        state, env);
+    case 'unchecked':
+      return traverseStmt(stmt.body, state, env);
+    case 'if': {
+      if (stmt.test) visitExpr(stmt.test, state, env);
+      const rThen = stmt.consequent
+        ? traverseStmt(stmt.consequent, state.clone(), env) : state.clone();
+      const rElse = stmt.alternate
+        ? traverseStmt(stmt.alternate, state.clone(), env) : state.clone();
+      return PState.union([rThen, rElse]);
+    }
+    case 'while':
+      return loopFixpoint(state, (work) => {
+        if (stmt.test) visitExpr(stmt.test, work, env);
+        return traverseStmt(stmt.body, work, env);
+      });
+    case 'doWhile':
+      return loopFixpoint(state, (work) => {
+        const r = traverseStmt(stmt.body, work, env);
+        if (r && stmt.test) visitExpr(stmt.test, r, env);
+        return r;
+      });
+    case 'for': {
+      if (stmt.init) {
+        state = traverseStmt(stmt.init, state, env);
+        if (state === null) return null;
+      }
+      return loopFixpoint(state, (work) => {
+        if (stmt.test) visitExpr(stmt.test, work, env);
+        const r = traverseStmt(stmt.body, work, env);
+        if (r && stmt.update) visitExpr(stmt.update, r, env);
+        return r;
+      });
+    }
+    case 'try': {
+      // The tried expression (external interaction or internal call)
+      // precedes every clause.
+      if (stmt.externalCall) visitExpr(stmt.externalCall, state, env);
+      const rs = [];
+      if (stmt.body) rs.push(traverseStmt(stmt.body, state.clone(), env));
+      for (const clause of stmt.clauses || []) {
+        rs.push(traverseStmt(clause, state.clone(), env));
+      }
+      return PState.union(rs.length ? rs : [state]);
+    }
+    case 'return': {
+      // The returning path ends here; evaluate the expression in a dead
+      // clone so writes inside it are still witnessed but nothing flows on.
+      if (stmt.expr) visitExpr(stmt.expr, state.clone(), env);
+      return null;
+    }
+    case 'throw':
+      return null;
+    case 'expression': {
+      if (stmt.expr) {
+        // revert(...) terminates the path; its arguments are still
+        // evaluated before reverting.
+        const terminates = stmt.expr.kind === 'call' &&
+          stmt.expr.callee.kind === 'ident' &&
+          (stmt.expr.callee.name === 'revert' || stmt.expr.callee.name === 'throw');
+        if (terminates) { visitExpr(stmt.expr, state.clone(), env); return null; }
+        visitExpr(stmt.expr, state, env);
+      }
+      return state;
+    }
+    case 'varDecl':
+      if (stmt.initializer) visitExpr(stmt.initializer, state, env);
+      return state;
+    case 'emit':
+      if (stmt.expr) visitExpr(stmt.expr, state, env);
+      return state;
+    case 'break': case 'continue':
+      // Approximation: witnesses seen so far carry to post-loop code.
+      return state;
+    default:
+      for (const expr of statementExpressions(stmt)) visitExpr(expr, state, env);
+      return state;
+  }
+}
+
+function recordInteraction(node, state, env) {
+  const span = interactionSpan(node);
+  state.witnesses.add({
+    file: env.origin.file,
+    loc: span,
+    level: env.chain.length,
+    pos: `${env.origin.file}:${node.loc.startOffset}`,
+    entry: env.rootEntry ? stripNode(env.rootEntry) : null,
+    chainI: env.chain.map(stripNode),
+  });
+}
+
+function recordWrite(target, state, env) {
+  const sv = stateWriteRoot(env.view, target);
+  if (!sv) return;
+  for (const w of state.witnesses) {
+    env.sink({
+      file: env.origin.file,
+      loc: target.loc,
+      stateVar: sv.name,
+      reachable: w.entry !== null,
+      entry: w.entry,
+      level: w.level,
+      wPos: w.pos,
+      wFile: w.file,
+      wLoc: w.loc,
+      chainI: w.chainI,
+      chainW: env.chain.map(stripNode),
+    });
+  }
+}
+
+// Ordered expression traversal. Children are visited before their parent
+// operation: call arguments/options evaluate before the interaction, and
+// an assignment's RHS evaluates before the store commits.
+function visitExpr(node, state, env) {
+  if (!node || typeof node !== 'object' || state === null) return;
+  switch (node.kind) {
+    case 'assign':
+      visitExpr(node.target, state, env);
+      visitExpr(node.value, state, env);
+      recordWrite(node.target, state, env);
+      return;
+    case 'unary':
+      visitExpr(node.operand, state, env);
+      if (node.op === '++' || node.op === '--' || node.op === 'delete') {
+        recordWrite(node.operand, state, env);
+      }
+      return;
+    case 'call': {
+      visitExpr(node.callee, state, env);
+      for (const a of node.args || []) visitExpr(a, state, env);
+      for (const o of node.options || []) visitExpr(o.value, state, env);
+      const callerDesc = env.chain[env.chain.length - 1];
+      const targets = internalCallTargets(env.view, node, callerDesc);
+      if (targets.length) {
+        for (const t of targets) state = expandInternal(t, state, env) || state;
+      } else if (isExternalInteraction(env.view, node)) {
+        recordInteraction(node, state, env);
+      }
+      return;
+    }
+    case 'conditional': {
+      visitExpr(node.test, state, env);
+      const a = state.clone();
+      visitExpr(node.cons, a, env);
+      const b = state.clone();
+      visitExpr(node.alt, b, env);
+      state.witnesses = PState.union([a, b]).witnesses;
+      return;
+    }
+    case 'binary':
+      visitExpr(node.left, state, env);
+      visitExpr(node.right, state, env);
+      return;
+    case 'member':
+      visitExpr(node.object, state, env);
+      return;
+    case 'index':
+      visitExpr(node.object, state, env);
+      if (node.index) visitExpr(node.index, state, env);
+      return;
+    case 'tuple':
+      for (const it of node.items || []) visitExpr(it, state, env);
+      return;
+    case 'structLiteral':
+      for (const f of node.fields || []) visitExpr(f.value, state, env);
+      return;
+    default:
+      return;
+  }
 }
 
 // ---- driver ----------------------------------------------------------------
@@ -893,6 +1197,10 @@ export function analyze(parsedFiles) {
   const registry = new Registry(parsedFiles);
   const views = registry.buildViews();
   const acc = new Map();
+  // Rule 3 accumulator, shared across views: same source location in an
+  // inherited contract is reported once even though every derived view
+  // visits it.
+  const stateAcc = new Map();
 
   for (const view of views) {
     const reach = computeReachability(view);
@@ -904,7 +1212,6 @@ export function analyze(parsedFiles) {
       const raw = [
         ...runDelegatecallRule(view, desc, wrapped),
         ...runUncheckedCallRule(view, desc, wrapped),
-        ...runStateUpdateRule(view, desc, wrapped, isEntry),
       ];
       const reachMap = reach.get(descKey(desc)) || new Map();
 
@@ -926,9 +1233,93 @@ export function analyze(parsedFiles) {
         }
       }
     }
+
+    for (const rec of runStateUpdateRuleView(view)) {
+      const wKey = `${rec.file}:${rec.loc.startOffset}:${rec.loc.endOffset}`;
+      let slot = stateAcc.get(wKey);
+      if (!slot) {
+        slot = { file: rec.file, loc: rec.loc, stateVar: rec.stateVar, perEntry: new Map() };
+        stateAcc.set(wKey, slot);
+      }
+      // One winning witness per triggering entry: fewest function levels,
+      // ties resolved by entry identity then witness source position.
+      const ek = rec.reachable ? entryKey(rec.entry) : null;
+      const prior = slot.perEntry.get(ek);
+      if (!prior || stateRecLess(rec, prior)) slot.perEntry.set(ek, rec);
+    }
   }
 
-  return finalize(acc);
+  return [...finalize(acc), ...finalizeState(stateAcc)];
+}
+
+// Ordering of witness records for the same write AND entry: fewest
+// function levels, then earliest witness position. Used for per-entry
+// winner selection; cross-entry ties are resolved by declaration order
+// (stable insertion order in the per-entry map), not here.
+function stateRecLess(a, b) {
+  if (a.level !== b.level) return a.level < b.level;
+  return a.wPos < b.wPos;
+}
+
+function finalizeState(stateAcc) {
+  const findings = [];
+  for (const slot of stateAcc.values()) {
+    // Reachable witnesses keep per-entry map insertion order: local roots
+    // run first (the unreachable key), then entry roots in view/entry
+    // declaration order. Same level therefore resolves to the earliest
+    // declared entry; position ties are already resolved per entry.
+    const reachableRecs = [];
+    for (const [ek, rec] of slot.perEntry.entries()) {
+      if (ek !== null) reachableRecs.push(rec);
+    }
+    const reachable = reachableRecs.length > 0;
+    // Among entries, fewest function levels wins; same level keeps the
+    // earliest declared triggering entry (stable insertion order).
+    let winner = reachableRecs[0] || null;
+    for (const rec of reachableRecs) {
+      if (rec.level < winner.level) winner = rec;
+    }
+    if (!winner) winner = slot.perEntry.get(null);
+    if (!winner) continue;
+
+    const entryPoints = [];
+    const seenEntries = new Set();
+    for (const rec of reachableRecs) {
+      const k = entryKey(rec.entry);
+      if (seenEntries.has(k)) continue;
+      seenEntries.add(k);
+      entryPoints.push(rec.entry);
+    }
+
+    findings.push({
+      ruleId: 'STATE_UPDATE_AFTER_CALL',
+      severity: RULES.STATE_UPDATE_AFTER_CALL.severity,
+      message: `公开入口在外部调用或转账之后写入重入敏感状态 ${slot.stateVar}，违反 checks-effects-interactions 顺序`,
+      location: {
+        file: slot.file,
+        startLine: slot.loc.startLine,
+        startColumn: slot.loc.startColumn,
+        endLine: slot.loc.endLine,
+        endColumn: slot.loc.endColumn,
+      },
+      reachable,
+      evidence: {
+        entryPoints,
+        callChain: reachable ? winner.chainW : [],
+        interaction: {
+          location: {
+            file: winner.wFile,
+            startLine: winner.wLoc.startLine,
+            startColumn: winner.wLoc.startColumn,
+            endLine: winner.wLoc.endLine,
+            endColumn: winner.wLoc.endColumn,
+          },
+          callChain: reachable ? winner.chainI : [],
+        },
+      },
+    });
+  }
+  return findings;
 }
 
 function finalize(acc) {
