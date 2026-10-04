@@ -788,40 +788,45 @@ function varChecked(stmt, name) {
 }
 
 // ---- rule 3: state update after external interaction -----------------------
+//
+// Path-sensitive, cross-function, built on BOUNDED PROCEDURAL INLINING:
+// the engine starts once at every method as a root frame and, walking in
+// evaluation order, inlines every statically resolved internal call as a
+// new function frame one level deeper. Modifier code is inlined by the
+// view already and keeps sharing the enclosing function's frame; linearized
+// base constructors run as a deeper prefix of their derived constructor.
+//
+// Inlining calls in place makes both relay directions fall out naturally:
+//   caller: interact(); callee(): write;   -> interaction precedes write
+//   callee(): interact(); caller: write;   -> interaction precedes write
+//
+// Ordering is decided on a may-CFG:
+//   * a write is witnessed by every external interaction (low-level calls,
+//     transfers, contract-typed member calls, `new X(...)`) occurring on
+//     the SAME static path before it;
+//   * if/else branches never merge before a write: an interaction in one
+//     branch cannot witness a write in the mutually exclusive other
+//     branch; events do flow to statements following the construct;
+//   * loops reach a fixed point, so an interaction in an earlier iteration
+//     witnesses a write in a later one;
+//   * try: the tried call precedes success and every catch clause, while
+//     the clauses stay mutually exclusive;
+//   * revert/throw abort the path; a normal `return` hands control (and
+//     the interactions evaluated so far) back to the caller. Inside a
+//     function, `return` resumes the enclosing modifier suffix, while a
+//     modifier's own `return` skips that suffix.
+//
+// Each witness records:
+//   depth    - function layers between interaction and write
+//               (same function = 1, one internal call apart = 2, ...);
+//   frameKey - the function actually containing the interaction point
+//               (inlined modifier code anchors to its enclosing function);
+//   byRoot   - map from the root frame whose walk proved this ordered
+//               path to the depth seen on that walk. An entry reaches the
+//               pattern iff it reaches one of those roots.
 
-function isExternalInteraction(view, n) {
-  if (n.kind !== 'call') return false;
-  if (n.callee.kind === 'newExpr') return true; // contract creation
-  const callee = n.callee;
-  if (callee.kind !== 'member') return false;
-  if (ALL_LOW_LEVEL.has(callee.property)) return true;
-  // Array/map storage built-ins are never external calls.
-  if (callee.property === 'push' || callee.property === 'pop') return false;
-  const obj = callee.object;
-  if (obj.kind === 'ident') {
-    if (obj.name === 'this') return true;       // this.foo() is external
-    if (obj.name === 'super') return false;     // super.foo() is internal
-    // Calls rooted in a state variable are external only when the state
-    // variable has a contract type; storage of array/mapping/struct/
-    // primitive kind has no external methods.
-    const sv = view.stateVars.get(obj.name);
-    if (sv) {
-      const t = sv.node.typeNode;
-      if (t && t.kind === 'typeElementary' &&
-          view.registry.contractByName.has(t.path[0])) {
-        return true;
-      }
-      return false;
-    }
-    // Explicitly qualified call to a contract in the project is treated
-    // as internal dispatch (library functions / same-type helpers).
-    if (view.registry.contractByName.has(obj.name)) {
-      const target = view.resolveMethod(callee.property, (n.args || []).length);
-      if (target && target.kind === 'function') return false;
-    }
-  }
-  return true;
-}
+const MAX_INLINE_DEPTH = 8;
+const MAX_LOOP_ITERS = 32;
 
 function stateWriteRoot(view, expr) {
   let e = expr;
@@ -833,58 +838,434 @@ function stateWriteRoot(view, expr) {
   return null;
 }
 
-function runStateUpdateRule(view, desc, wrapped, isEntry) {
-  if (!isEntry || !desc.node.body) return [];
-  const findings = [];
-  const steps = linearSteps(wrapped);
-  let interactionBefore = false;
-  let fired = false;
+function superTargets(view, callerDesc, name, argc) {
+  const out = [];
+  let started = false;
+  for (const { file, contract } of view.linearized) {
+    if (!started) { if (contract.name === callerDesc.contract) started = true; continue; }
+    const t = findMethodInContract(view, contract, file, name, argc);
+    if (t) out.push(t);
+  }
+  return out;
+}
 
-  for (const { stmt, origin } of steps) {
-    const exprs = statementExpressions(stmt);
-    if (stmt.kind === 'tryCall') exprs.push(stmt.expr);
-
-    // External interactions textually present in this step.
-    let hasInteraction = false;
-    for (const expr of exprs) {
-      walkExpr(expr, (n) => {
-        if (isExternalInteraction(view, n)) hasInteraction = true;
-      });
+// Classify a member call and resolve internal dispatch targets when it is
+// not an external interaction. Mirrors the interaction predicate used by
+// the baseline rules.
+function classifyMemberCall(view, callerDesc, n) {
+  const callee = n.callee;
+  const argc = (n.args || []).length;
+  if (ALL_LOW_LEVEL.has(callee.property)) return { external: true };
+  if (callee.property === 'push' || callee.property === 'pop') {
+    return { external: false, targets: [] };
+  }
+  const obj = callee.object;
+  if (obj.kind === 'ident') {
+    if (obj.name === 'this') return { external: true };
+    if (obj.name === 'super') {
+      return { external: false, targets: superTargets(view, callerDesc, callee.property, argc) };
     }
+    const sv = view.stateVars.get(obj.name);
+    if (sv) {
+      const t = sv.node.typeNode;
+      const isContract = t && t.kind === 'typeElementary' &&
+        view.registry.contractByName.has(t.path[0]);
+      return { external: isContract, targets: [] };
+    }
+    if (view.registry.contractByName.has(obj.name)) {
+      const target = view.resolveMethod(callee.property, argc);
+      if (target && target.kind === 'function' && target.node && target.node.body) {
+        return { external: false, targets: [target] };
+      }
+    }
+  }
+  return { external: true };
+}
 
-    // Any storage store in this statement executes only after every
-    // expression (including external calls) has been evaluated, so a write
-    // in a statement containing an interaction is always post-call.
-    if ((interactionBefore || hasInteraction) && !fired) {
-      walkStatement(stmt, (st) => {
-        if (fired) return;
-        let writes = [];
-        if (st.kind === 'expression' && st.expr) {
-          const e = st.expr;
-          if (e.kind === 'assign') writes = [[e.target.loc, e.target]];
-          else if (e.kind === 'unary' && (e.op === '++' || e.op === '--' || e.op === 'delete')) {
-            writes = [[e.operand.loc, e.operand]];
-          }
+function runStateEngine(view) {
+  // write key -> {file, location, stateVar, frameKey, witnesses: Map(k->w)}
+  const writes = new Map();
+
+  const atomKey = (a) => `${a.frameKey}:${a.file}:${a.loc.startOffset}`;
+  // Merge interaction sets, keeping the smallest frame depth per point.
+  const mergeA = (...lists) => {
+    const best = new Map();
+    for (const list of lists) {
+      if (!list) continue;
+      for (const a of list) {
+        const k = atomKey(a);
+        const prior = best.get(k);
+        if (!prior || prior.di > a.di) best.set(k, { ...a });
+      }
+    }
+    return [...best.values()];
+  };
+
+  const writesOf = (stmt) => {
+    if (stmt.kind !== 'expression' || !stmt.expr) return [];
+    const e = stmt.expr;
+    if (e.kind === 'assign') return [[e.target.loc, e.target]];
+    if (e.kind === 'unary' && (e.op === '++' || e.op === '--' || e.op === 'delete')) {
+      return [[e.operand.loc, e.operand]];
+    }
+    return [];
+  };
+
+  // Per-root-walk state.
+  function makeWalker(rootDesc) {
+    const rootKey = descKey(rootDesc);
+
+    // atoms: {file, loc, di, frameKey}
+    const makeAtom = (file, loc, frame) =>
+      ({ file, loc, di: frame.depth, frameKey: descKey(frame.desc) });
+
+    const recordWrite = (loc, target, origin, frame, ws) => {
+      const sv = stateWriteRoot(view, target);
+      if (!sv) return;
+      const key = `${origin.file}:${loc.startOffset}:${loc.endOffset}`;
+      let entry = writes.get(key);
+      if (!entry) {
+        entry = {
+          file: origin.file, location: loc, stateVar: sv.name,
+          frameKey: descKey(frame.desc), witnesses: new Map(),
+        };
+        writes.set(key, entry);
+      }
+      for (const a of ws) {
+        // Function layers separating interaction and write on this path;
+        // recorded per root since the same point can sit at a different
+        // frame depth when reached from different roots.
+        const depth = Math.abs(a.di - frame.depth) + 1;
+        const wk = atomKey(a);
+        let w = entry.witnesses.get(wk);
+        if (!w) {
+          w = { file: a.file, loc: a.loc, frameKey: a.frameKey, byRoot: new Map() };
+          entry.witnesses.set(wk, w);
         }
-        for (const [loc, target] of writes) {
-          const sv = stateWriteRoot(view, target);
-          if (sv) {
-            fired = true;
-            findings.push({
-              ruleId: 'STATE_UPDATE_AFTER_CALL',
-              origin: origin || desc,
-              location: loc,
-              stateVar: sv.name,
-            });
+        const priorDepth = w.byRoot.get(rootKey);
+        if (priorDepth === undefined || depth < priorDepth) w.byRoot.set(rootKey, depth);
+      }
+    };
+
+    // Inline a set of resolved callees at the current evaluation point.
+    // `carry` holds interactions already evaluated. A callee that completes
+    // normally (falls off the end OR hits a `return`) hands its effects
+    // back to the caller; a callee that only reverts contributes nothing.
+    const invoke = (targets, frame, carry) => {
+      const produced = [];
+      for (const t of targets) {
+        if (!t.node || !t.node.body) continue;
+        const tk = descKey(t);
+        if (frame.stack.has(tk) || frame.depth + 1 > MAX_INLINE_DEPTH) continue;
+        const inner = {
+          desc: t, depth: frame.depth + 1, rootKey,
+          stack: new Set(frame.stack).add(tk),
+        };
+        const prefix = t.kind === 'constructor' ? ctorPrefix(inner, carry) : [];
+        const r = walk(t, inner, mergeA(carry, prefix));
+        if (r.fall) produced.push(...r.fall);
+        if (r.ret) produced.push(...r.ret);
+      }
+      return produced;
+    };
+
+    // Evaluate one expression in order: threading `carry`, collecting
+    // external-interaction atoms and inlining internal calls.
+    const evalExpr = (expr, origin, frame, carry) => {
+      const out = [];
+      let cur = carry;
+      const atom = (a) => { out.push(a); cur = mergeA(cur, [a]); };
+      const ev = (x) => {
+        if (!x || typeof x !== 'object') return;
+        switch (x.kind) {
+          case 'binary': ev(x.left); ev(x.right); break;
+          case 'unary': ev(x.operand); break;
+          case 'assign': ev(x.target); ev(x.value); break;
+          case 'conditional': ev(x.test); ev(x.cons); ev(x.alt); break;
+          case 'member': ev(x.object); break;
+          case 'index': ev(x.object); if (x.index) ev(x.index); break;
+          case 'tuple': for (const it of x.items || []) ev(it); break;
+          case 'structLiteral':
+            for (const fld of x.fields || []) ev(fld.value); break;
+          case 'call': {
+            ev(x.callee);
+            for (const a of x.args || []) ev(a);
+            for (const o of x.options || []) ev(o.value);
+            const callee = x.callee;
+            if (callee.kind === 'newExpr') { atom(makeAtom(origin.file, x.loc, frame)); break; }
+            if (callee.kind === 'ident') {
+              if (BUILTIN_CALLS.has(callee.name)) break;
+              const t = view.resolveMethod(callee.name, (x.args || []).length);
+              const got = invoke(t ? [t] : [], frame, cur);
+              out.push(...got); cur = mergeA(cur, got);
+              break;
+            }
+            if (callee.kind === 'member') {
+              const cls = classifyMemberCall(view, frame.desc, x);
+              if (cls.external) {
+                atom(makeAtom(origin.file, operationSpan(x), frame));
+              } else {
+                const got = invoke(cls.targets, frame, cur);
+                out.push(...got); cur = mergeA(cur, got);
+              }
+            }
             break;
           }
+          default: break;
         }
-      });
-    }
+      };
+      ev(expr);
+      return out;
+    };
 
-    if (hasInteraction) interactionBefore = true;
+    const atomsOf = (expr, origin, frame, carry) =>
+      expr ? evalExpr(expr, origin, frame, carry) : [];
+
+    // Effective region honoring modifier placeholder semantics: the
+    // function body sits inside nested modifier regions, and a `return`
+    // inside the body only leaves the body — the suffixes after each `_`
+    // still execute (EVM return jumps to after the placeholder).
+    const regionItemsOf = (desc) => {
+      const bodyItems = (desc.node.body ? desc.node.body.statements : [])
+        .map((stmt) => ({ stmt, origin: desc }));
+      // The function body is a body-region (its `return` resumes the
+      // innermost modifier suffix); every applied modifier wraps it in a
+      // mod-region that lets a `return` in modifier code escape all
+      // remaining suffixes.
+      let region = { kind: 'bodyRegion', items: bodyItems };
+      const mods = desc.node.modifiers || [];
+      for (let i = mods.length - 1; i >= 0; i--) {
+        const mod = view.modifiers.get(mods[i]);
+        const pieces = mod ? view.modifierPieces(mods[i]) : null;
+        const items = [];
+        if (pieces) items.push(...pieces.pre);
+        items.push({ stmt: region, origin: mod || desc });
+        if (pieces) items.push(...pieces.post);
+        region = { kind: 'modRegion', items };
+      }
+      return [{ stmt: region, origin: desc }];
+    };
+
+    // Linearized base constructors preceding `frame`'s constructor body.
+    // Solidity runs them most-base-first, i.e. the reverse of the
+    // most-derived-first linearization; their effects accumulate in order.
+    const ctorPrefix = (frame, carry) => {
+      const chain = [];
+      let passedSelf = false;
+      for (const { file, contract } of view.linearized) {
+        if (!passedSelf) { if (contract.name === frame.desc.contract) passedSelf = true; continue; }
+        const node = (contract.nodes || []).find((fn) => fn.functionKind === 'constructor');
+        if (node && node.body) {
+          chain.push({ ...descriptorFor(node, file, contract.name, (node.params || []).length), node });
+        }
+      }
+      let acc = carry;
+      for (const b of chain.reverse()) {
+        const bk = descKey(b);
+        if (frame.stack.has(bk) || frame.depth + 1 > MAX_INLINE_DEPTH) continue;
+        const inner = { desc: b, depth: frame.depth + 1, rootKey, stack: new Set(frame.stack).add(bk) };
+        const r = walk(b, inner, acc);
+        // Base constructors complete normally before the derived body.
+        if (r.fall) acc = mergeA(acc, r.fall);
+        if (r.ret) acc = mergeA(acc, r.ret);
+      }
+      return acc === carry ? [] : acc;
+    };
+
+    // A flow result carries four disjoint exit channels, each holding the
+    // interaction set visible on that exit (or null = unreachable):
+    //   fall - runs to the end of the region and continues after it;
+    //   ret  - leaves the whole function via `return`;
+    //   brk/cont - transfer control to the enclosing loop.
+    // `revert`/`throw` produce no exit (the path is aborted).
+    const flow = (fall = null, ret = null, brk = null, cont = null) =>
+      ({ fall, ret, brk, cont });
+    const mkFall = (a) => flow(a, null, null, null);
+    const dead = () => flow(null, null, null, null);
+
+    // Walk one frame's effective (modifier-inlined) statements.
+    const walk = (desc, frame, pre) => {
+      const recList = (list, carryP) => {
+        let carry = carryP;
+        let ret = null;
+        let brk = null;
+        let cont = null;
+        for (const { stmt, origin } of list) {
+          const r = rec(stmt, origin, carry);
+          if (r.ret) ret = mergeA(ret, r.ret);
+          if (r.brk) brk = mergeA(brk, r.brk);
+          if (r.cont) cont = mergeA(cont, r.cont);
+          if (r.fall === null) return flow(null, ret, brk, cont);
+          carry = r.fall;
+        }
+        return flow(carry, ret, brk, cont);
+      };
+
+      const rec = (s, origin, carryP) => {
+        switch (s.kind) {
+          case 'block':
+            return recList((s.statements || []).map((stmt) => ({ stmt, origin })), carryP);
+          case 'unchecked':
+            return rec(s.body, origin, carryP);
+
+          case 'bodyRegion': {
+            // A function-body return resumes the enclosing modifier
+            // suffix, so the ret channel becomes fall-through here.
+            const r = recList(s.items, carryP);
+            return flow(mergeA(r.fall, r.ret), null, r.brk, r.cont);
+          }
+          case 'modRegion':
+            // Returns originating in this modifier's own code escape all
+            // remaining suffixes; pass every channel through unchanged.
+            return recList(s.items, carryP);
+
+          case 'if': {
+            const preC = mergeA(carryP, atomsOf(s.test, origin, frame, carryP));
+            const rt = rec(s.consequent, origin, preC);
+            if (!s.alternate) {
+              // False-condition path (preC) merges with a falling then.
+              const fallParts = [preC];
+              if (rt.fall) fallParts.push(rt.fall);
+              return flow(mergeA(...fallParts), rt.ret, rt.brk, rt.cont);
+            }
+            const re = rec(s.alternate, origin, preC);
+            return flow(
+              mergeA(...[rt.fall, re.fall].filter(Boolean)),
+              mergeA(...[rt.ret, re.ret].filter(Boolean)),
+              mergeA(...[rt.brk, re.brk].filter(Boolean)),
+              mergeA(...[rt.cont, re.cont].filter(Boolean)),
+            );
+          }
+
+          case 'while':
+          case 'doWhile':
+          case 'for':
+            return recLoop(s, origin, frame, carryP);
+
+          case 'try': {
+            const preTry = mergeA(carryP, atomsOf(s.externalCall, origin, frame, carryP));
+            const rb = rec(s.body, origin, preTry);
+            const clauses = s.clauses || [];
+            const rcList = clauses.map((c) => rec(c, origin, preTry));
+            const pick = (chan) =>
+              mergeA(...[rb[chan], ...rcList.map((x) => x[chan])].filter(Boolean));
+            // With no catch clause, a failed call reverts: only the success
+            // body's exits survive.
+            if (clauses.length === 0) return rb;
+            return flow(pick('fall'), pick('ret'), pick('brk'), pick('cont'));
+          }
+
+          case 'return': {
+            // The returned expression is evaluated before control leaves.
+            const atoms = atomsOf(s.expr, origin, frame, carryP);
+            return flow(null, mergeA(carryP, atoms), null, null);
+          }
+
+          case 'throw':
+            return dead();
+
+          case 'break':
+            return flow(null, null, carryP, null);
+          case 'continue':
+            return flow(null, null, null, carryP);
+
+          case 'varDecl':
+            return mkFall(mergeA(carryP, atomsOf(s.initializer, origin, frame, carryP)));
+
+          case 'emit':
+            return mkFall(mergeA(carryP, atomsOf(s.expr, origin, frame, carryP)));
+
+          case 'expression': {
+            if (isRevertCall(s.expr)) return dead();
+            const atoms = atomsOf(s.expr, origin, frame, carryP);
+            const ws = mergeA(carryP, atoms);
+            for (const [loc, target] of writesOf(s)) {
+              recordWrite(loc, target, origin, frame, ws);
+            }
+            return mkFall(ws);
+          }
+
+          default:
+            return mkFall(carryP);
+        }
+      };
+
+      // Loop handling as a monotone fixed point over the set of
+      // interactions that may be live when entering the body. Earlier
+      // iterations therefore witness later-iteration body writes; the
+      // false-test / break exits witness writes after the loop.
+      const recLoop = (s, origin, frame, carryP) => {
+        let enter = carryP;
+        let ret = null;
+        let exited = null;
+
+        if (s.kind === 'for' && s.init) {
+          const ri = rec(s.init, origin, enter);
+          if (ri.ret) ret = mergeA(ret, ri.ret);
+          if (ri.fall === null) return flow(null, ret, null, null);
+          enter = ri.fall;
+        }
+
+        const addTest = (c) => s.test ? mergeA(c, atomsOf(s.test, origin, frame, c)) : c;
+
+        for (let i = 0; i < MAX_LOOP_ITERS; i++) {
+          let bodyInput;
+          if (s.kind === 'doWhile') {
+            bodyInput = enter; // condition is at the bottom
+          } else {
+            const atTest = addTest(enter);
+            exited = mergeA(exited, atTest); // exit via false condition
+            bodyInput = atTest;
+          }
+
+          const rb = rec(s.body, origin, bodyInput);
+          if (rb.ret) ret = mergeA(ret, rb.ret);
+          if (rb.brk) exited = mergeA(exited, rb.brk);
+
+          // Body fall-through and `continue` feed the next iteration.
+          let repeat = mergeA(...[rb.fall, rb.cont].filter(Boolean));
+          if (repeat) {
+            if (s.kind === 'for' && s.update) {
+              repeat = mergeA(repeat, atomsOf(s.update, origin, frame, repeat));
+            }
+            if (s.test) {
+              repeat = addTest(repeat);
+              // Bottom/re-test may also be false -> exit carries it.
+              exited = mergeA(exited, repeat);
+            }
+          }
+
+          const nextEnter = mergeA(enter, repeat || []);
+          if (nextEnter.length === enter.length) { enter = nextEnter; break; }
+          enter = nextEnter;
+        }
+        return flow(exited, ret, null, null);
+      };
+
+      return recList(regionItemsOf(desc), pre);
+    };
+
+    return { rootKey, walk, ctorPrefix };
   }
-  return findings;
+
+  // One root walk per method (entries and non-entries alike): a pattern
+  // provable only inside an unreachable helper is still reported, then
+  // marked reachable=false by the driver.
+  for (const root of view.methods.values()) {
+    if (!root.node || !root.node.body) continue;
+    const rk = descKey(root);
+    const frame = { desc: root, depth: 1, rootKey: rk, stack: new Set([rk]) };
+    const walker = makeWalker(root);
+    const initial = root.kind === 'constructor' ? walker.ctorPrefix(frame, []) : [];
+    walker.walk(root, frame, initial);
+  }
+
+  // A storage write with no preceding interaction on any path is not the
+  // pattern at all.
+  for (const [k, entry] of writes) {
+    if (entry.witnesses.size === 0) writes.delete(k);
+  }
+  return writes;
 }
 
 // ---- driver ----------------------------------------------------------------
@@ -896,19 +1277,16 @@ export function analyze(parsedFiles) {
 
   for (const view of views) {
     const reach = computeReachability(view);
+
     for (const desc of view.methods.values()) {
       if (!desc.node || !desc.node.body) continue;
       const wrapped = view.effectiveStatements(desc);
-      const isEntry = view.entries.some((e) => e.node && descKey(e) === descKey(desc));
-
-      const raw = [
-        ...runDelegatecallRule(view, desc, wrapped),
-        ...runUncheckedCallRule(view, desc, wrapped),
-        ...runStateUpdateRule(view, desc, wrapped, isEntry),
-      ];
       const reachMap = reach.get(descKey(desc)) || new Map();
 
-      for (const r of raw) {
+      for (const r of [
+        ...runDelegatecallRule(view, desc, wrapped),
+        ...runUncheckedCallRule(view, desc, wrapped),
+      ]) {
         const key = `${r.ruleId}:${r.origin.file}:${r.location.startOffset}:${r.location.endOffset}`;
         let f = acc.get(key);
         if (!f) {
@@ -926,14 +1304,66 @@ export function analyze(parsedFiles) {
         }
       }
     }
+
+    // STATE_UPDATE_AFTER_CALL: one path-sensitive, cross-function walk per
+    // view. Reachability of an ordered (interaction ... write) path is
+    // "an entry reaches the root frame whose walk proved the path".
+    for (const wEntry of runStateEngine(view).values()) {
+      const key = `STATE_UPDATE_AFTER_CALL:${wEntry.file}:${wEntry.location.startOffset}:${wEntry.location.endOffset}`;
+      let f = acc.get(key);
+      if (!f) {
+        f = {
+          ruleId: 'STATE_UPDATE_AFTER_CALL',
+          severity: RULES.STATE_UPDATE_AFTER_CALL.severity,
+          file: wEntry.file, location: wEntry.location,
+          detail: { ruleId: 'STATE_UPDATE_AFTER_CALL', stateVar: wEntry.stateVar },
+          kind: 'state',
+          cands: [],    // reachable witnesses: {ek, depth, chainWrite, chainInter, wFile, wLoc}
+          fallback: [], // {depth, wFile, wLoc} for the unreachable case
+        };
+        acc.set(key, f);
+      }
+      const reachWrite = reach.get(wEntry.frameKey) || new Map();
+      for (const w of wEntry.witnesses.values()) {
+        const reachInter = reach.get(w.frameKey) || new Map();
+        for (const [rootKey, depth] of w.byRoot) {
+          const rootReach = reach.get(rootKey);
+          if (rootReach) {
+            for (const ek of rootReach.keys()) {
+              const chainWrite = reachWrite.get(ek);
+              const chainInter = reachInter.get(ek);
+              if (!chainWrite || !chainInter) continue;
+              f.cands.push({
+                ek, depth, chainWrite, chainInter, wFile: w.file, wLoc: w.loc,
+              });
+            }
+          }
+          f.fallback.push({ depth, wFile: w.file, wLoc: w.loc });
+        }
+      }
+    }
   }
 
   return finalize(acc);
 }
 
+function locOf(file, loc) {
+  return {
+    file,
+    startLine: loc.startLine,
+    startColumn: loc.startColumn,
+    endLine: loc.endLine,
+    endColumn: loc.endColumn,
+  };
+}
+
 function finalize(acc) {
   const findings = [];
   for (const f of acc.values()) {
+    if (f.kind === 'state') {
+      findings.push(finalizeState(f));
+      continue;
+    }
     const chains = [...f.entries.values()].map((v) => v.chain)
       .sort((a, b) => a.length - b.length);
     const entryPoints = [];
@@ -960,13 +1390,7 @@ function finalize(acc) {
       ruleId: f.ruleId,
       severity: f.severity,
       message,
-      location: {
-        file: f.file,
-        startLine: f.location.startLine,
-        startColumn: f.location.startColumn,
-        endLine: f.location.endLine,
-        endColumn: f.location.endColumn,
-      },
+      location: locOf(f.file, f.location),
       reachable,
       evidence: {
         entryPoints: reachable ? entryPoints : [],
@@ -975,4 +1399,95 @@ function finalize(acc) {
     });
   }
   return findings;
+}
+
+// State-update findings carry an `interaction` witness: the external
+// interaction that, on the same static path, precedes the storage write.
+function finalizeState(f) {
+  const d = f.detail;
+  const message = `公开入口在外部调用或转账之后写入重入敏感状态 ${d.stateVar}，违反 checks-effects-interactions 顺序`;
+
+  const entryCmp = (a, b) => {
+    if (a.contract !== b.contract) return (a.contract || '') < (b.contract || '') ? -1 : 1;
+    if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  };
+
+  // One row per entry: shortest write chain decides entry order, then the
+  // entry identity (matching the generic finalizer's chain ordering).
+  const perEntry = new Map();
+  for (const c of f.cands) {
+    const prev = perEntry.get(c.ek);
+    if (!prev ||
+        prev.chainWrite.length > c.chainWrite.length ||
+        (prev.chainWrite.length === c.chainWrite.length &&
+         entryCmp(prev.chainWrite[0], c.chainWrite[0]) > 0)) {
+      perEntry.set(c.ek, c);
+    }
+  }
+  const entryRows = [...perEntry.values()].sort((a, b) => {
+    if (a.chainWrite.length !== b.chainWrite.length) {
+      return a.chainWrite.length - b.chainWrite.length;
+    }
+    return entryCmp(a.chainWrite[0], b.chainWrite[0]);
+  });
+
+  const entryPoints = [];
+  for (const c of entryRows) {
+    const e = c.chainWrite[0];
+    if (!entryPoints.some((x) => x.name === e.name && x.contract === e.contract &&
+                                x.kind === e.kind)) {
+      entryPoints.push(e);
+    }
+  }
+  const reachable = entryPoints.length > 0;
+
+  // Single witness across all (entry, witness) pairs: fewest function
+  // frames; ties follow entry order, then the earliest interaction point.
+  let chosen = null;
+  if (reachable) {
+    const entryIndex = (e) =>
+      entryPoints.findIndex((x) => x.name === e.name && x.contract === e.contract &&
+                                  x.kind === e.kind);
+    const ranked = [...f.cands].sort((a, b) => {
+      if (a.depth !== b.depth) return a.depth - b.depth;
+      const ia = entryIndex(a.chainWrite[0]);
+      const ib = entryIndex(b.chainWrite[0]);
+      if (ia !== ib) return ia - ib;
+      if (a.wFile !== b.wFile) return a.wFile < b.wFile ? -1 : 1;
+      return a.wLoc.startOffset - b.wLoc.startOffset;
+    });
+    chosen = ranked[0];
+  } else {
+    const best = new Map();
+    for (const x of f.fallback) {
+      const k = `${x.wFile}:${x.wLoc.startOffset}`;
+      const prior = best.get(k);
+      if (!prior || prior.depth > x.depth) best.set(k, x);
+    }
+    const ranked = [...best.values()].sort((a, b) => {
+      if (a.depth !== b.depth) return a.depth - b.depth;
+      if (a.wFile !== b.wFile) return a.wFile < b.wFile ? -1 : 1;
+      return a.wLoc.startOffset - b.wLoc.startOffset;
+    });
+    chosen = ranked[0] || null;
+  }
+
+  const interaction = {
+    location: chosen ? locOf(chosen.wFile, chosen.wLoc) : null,
+    callChain: reachable && chosen ? chosen.chainInter : [],
+  };
+
+  return {
+    ruleId: f.ruleId,
+    severity: f.severity,
+    message,
+    location: locOf(f.file, f.location),
+    reachable,
+    evidence: {
+      entryPoints: reachable ? entryPoints : [],
+      callChain: reachable ? entryRows[0].chainWrite : [],
+      interaction,
+    },
+  };
 }

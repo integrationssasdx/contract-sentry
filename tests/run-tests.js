@@ -206,8 +206,10 @@ contract Reentry {
   assert(r.code === 0, `state: exit 0 (got ${r.code})`);
   const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
   const lines = hits.map((h) => h.location.startLine).sort((a, b) => a - b);
-  // Fixture line 1 is blank: bad write(8), transferThenWrite total+=1 (16).
-  assert(lines.join(',') === '8,16', `state: expected 8,16 got ${lines}`);
+  // Fixture line 1 is blank: bad write(8), transferThenWrite total+=1 (16),
+  // internalOnly write(20). The internal-helper pattern is reported too
+  // but is unreachable from any public entry.
+  assert(lines.join(',') === '8,16,20', `state: expected 8,16,20 got ${lines}`);
   assert(hits.every((h) => h.severity === 'high'), 'state: severity high');
   // internalOnly must not be an entry finding for the state rule,
   // but its call() is still an unchecked call, reachable=false.
@@ -215,6 +217,26 @@ contract Reentry {
     .find((f) => f.location.startLine === 19);
   assert(internalUnchecked && internalUnchecked.reachable === false,
     'state: internal helper call reachable=false');
+  const internalState = hits.find((h) => h.location.startLine === 20);
+  assert(internalState && internalState.reachable === false,
+    'state: internal helper write reported reachable=false');
+  assert(internalState.evidence.entryPoints.length === 0,
+    'state: unreachable empty entryPoints');
+  assert(internalState.evidence.callChain.length === 0,
+    'state: unreachable empty callChain');
+  assert(Array.isArray(internalState.evidence.interaction.callChain) &&
+    internalState.evidence.interaction.callChain.length === 0,
+    'state: unreachable empty interaction.callChain');
+  assert(internalState.evidence.interaction.location &&
+    internalState.evidence.interaction.location.startLine === 19,
+    'state: unreachable interaction.location retained at call site');
+  // Reachable findings carry the witness interaction and its chain.
+  const bad = hits.find((h) => h.location.startLine === 8);
+  assert(bad.evidence.interaction.location.startLine === 7,
+    'state: interaction.location points at the preceding call');
+  assert(bad.evidence.interaction.callChain.length === 1 &&
+    bad.evidence.interaction.callChain[0].name === 'bad',
+    'state: interaction.callChain entry to interaction fn');
   sb.remove();
 }
 
@@ -443,6 +465,260 @@ contract T {
   sb.remove();
 }
 
+function testStateRelayChains() {
+  const sb = makeSandbox();
+  sb.write('relay.sol', `
+pragma solidity ^0.8.0;
+contract Relay {
+    uint256 a;
+    uint256 b;
+    function forward(address to) public {
+        to.call("");
+        fw();
+    }
+    function fw() internal { a = 1; }
+    function backward(address to) public {
+        bw(to);
+        b = 2;
+    }
+    function bw(address to) internal { to.transfer(1); }
+    function deep(address to) public { d1(to); }
+    function d1(address to) internal { d2(to); }
+    function d2(address to) internal { d3(to); }
+    function d3(address to) internal { to.send(1); a = 3; }
+}
+`);
+  const r = run(path.join(sb.dir, 'relay.sol'));
+  assert(r.code === 0, `relay: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  const byLine = Object.fromEntries(hits.map((h) => [h.location.startLine, h]));
+  // Fixture line 1 blank: fw write(10), backward write(13), d3 write(19).
+  assert(Object.keys(byLine).sort((x, y) => x - y).join(',') === '10,13,19',
+    `relay: writes at 10,13,19 got ${Object.keys(byLine)}`);
+
+  // Caller interacts, callee writes: interaction stays in the caller.
+  const fwd = byLine[10];
+  assert(fwd.reachable === true, 'relay: forward reachable');
+  assert(fwd.evidence.callChain.map((c) => c.name).join('->') === 'forward->fw',
+    'relay: write chain forward->fw');
+  assert(fwd.evidence.interaction.location.startLine === 7,
+    'relay: forward interaction at caller call line 7');
+  assert(fwd.evidence.interaction.callChain.map((c) => c.name).join('->') === 'forward',
+    'relay: interaction chain is entry only');
+
+  // Callee interacts, caller writes: chain reaches into the callee.
+  const back = byLine[13];
+  assert(back.evidence.interaction.location.startLine === 15,
+    'relay: backward interaction at callee transfer line 15');
+  assert(back.evidence.interaction.callChain.map((c) => c.name).join('->') === 'backward->bw',
+    'relay: interaction chain backward->bw');
+
+  // Multi-level internal chain.
+  const dp = byLine[19];
+  const deepNames = 'deep->d1->d2->d3';
+  assert(dp.evidence.callChain.map((c) => c.name).join('->') === deepNames,
+    'relay: deep write chain');
+  assert(dp.evidence.interaction.callChain.map((c) => c.name).join('->') === deepNames,
+    'relay: deep interaction chain');
+  assert(dp.evidence.interaction.location.startLine === 19,
+    'relay: deep interaction at send in d3');
+  sb.remove();
+}
+
+function testStateBranchOrdering() {
+  const sb = makeSandbox();
+  sb.write('flow.sol', `
+pragma solidity ^0.8.0;
+contract Flow {
+    uint256 a;
+    function mutex(address to, bool ok) public {
+        if (ok) { to.call(""); } else { a = 1; }
+    }
+    function sameBranch(address to, bool ok) public {
+        if (ok) { to.call(""); a = 2; }
+    }
+    function afterIf(address to, bool ok) public {
+        if (ok) { to.call(""); }
+        a = 3;
+    }
+    function loopWitness(address to) public {
+        for (uint i = 0; i < 2; i++) {
+            if (i > 0) { a = 4; }
+            to.call("");
+        }
+    }
+    function retFlow(address to, bool ok) public {
+        if (ok) { to.call(""); return; }
+        a = 5;
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'flow.sol'));
+  assert(r.code === 0, `flow: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  // Fixture line 1 blank: sameBranch write(9), afterIf write(13),
+  // loopWitness write(17). mutex else-write (6) and retFlow write (23)
+  // are on mutually exclusive / terminated paths and must NOT appear.
+  const lines = hits.map((h) => h.location.startLine).sort((x, y) => x - y);
+  assert(lines.join(',') === '9,13,17', `flow: expected 9,13,17 got ${lines}`);
+  assert(hits.every((h) => h.reachable), 'flow: all branch findings reachable');
+  sb.remove();
+}
+
+function testStateWitnessDepthAndEntries() {
+  const sb = makeSandbox();
+  sb.write('depth.sol', `
+pragma solidity ^0.8.0;
+contract Depth {
+    uint256 a;
+    function h(address to) internal { to.send(1); }
+    function e(address to) public {
+        to.transfer(2);
+        h(to);
+        a = 1;
+    }
+    function alsoCallsH(address to) public {
+        h(to);
+        a = 2;
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'depth.sol'));
+  assert(r.code === 0, `depth: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  const byLine = Object.fromEntries(hits.map((h) => [h.location.startLine, h]));
+  // Fixture line 1 blank: writes at 9 and 13.
+  assert(Object.keys(byLine).sort((x, y) => x - y).join(',') === '9,13',
+    `depth: writes at 9,13 got ${Object.keys(byLine)}`);
+  // Shallow (same-function) interaction beats the deeper callee one.
+  assert(byLine[9].evidence.interaction.location.startLine === 7,
+    'depth: write 9 witnessed by depth-1 transfer at line 7');
+  // Only path is through the helper.
+  assert(byLine[13].evidence.interaction.location.startLine === 5,
+    'depth: write 13 witnessed by helper send at line 5');
+  assert(byLine[13].evidence.interaction.callChain.map((c) => c.name).join('->') ===
+    'alsoCallsH->h', 'depth: interaction chain through helper');
+  sb.remove();
+}
+
+function testStateFreeFnAndCtorChain() {
+  const sb = makeSandbox();
+  sb.write('cross.sol', `
+pragma solidity ^0.8.0;
+function freeDo(address to) { to.call(""); }
+contract P { uint256 q; constructor(address a) { a.transfer(1); } }
+contract C is P {
+    uint256 s;
+    constructor(address a) P(a) {
+        s = 1;
+    }
+    function viaFree(address to) public {
+        freeDo(to);
+        s = 2;
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'cross.sol'));
+  assert(r.code === 0, `cross: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  const byLine = Object.fromEntries(hits.map((h) => [h.location.startLine, h]));
+  // Fixture line 1 blank: ctor write(8), viaFree write(12).
+  assert(Object.keys(byLine).sort((x, y) => x - y).join(',') === '8,12',
+    `cross: writes at 8,12 got ${Object.keys(byLine)}`);
+
+  const ctor = byLine[8];
+  assert(ctor.evidence.entryPoints[0].kind === 'constructor',
+    'cross: ctor entry kind');
+  assert(ctor.evidence.interaction.location.startLine === 4,
+    'cross: ctor write witnessed by base-constructor transfer at line 4');
+  assert(ctor.evidence.interaction.callChain.map((c) => c.kind).join('->') ===
+    'constructor->constructor', 'cross: interaction chain through base ctor');
+
+  const vf = byLine[12];
+  assert(vf.evidence.interaction.location.startLine === 3,
+    'cross: free-function interaction at line 3');
+  const ic = vf.evidence.interaction.callChain;
+  assert(ic[0].name === 'viaFree' && ic[1].name === 'freeDo' && ic[1].contract === null,
+    'cross: interaction chain viaFree -> free function');
+  sb.remove();
+}
+
+function testStateTerminationAndModifiers() {
+  const sb = makeSandbox();
+  sb.write('term.sol', `
+pragma solidity ^0.8.0;
+contract Term {
+    uint256 a;
+    uint256 b;
+    address to;
+    modifier postEffect {
+        _;
+        a = 1;
+    }
+    function bodyReturns() public postEffect {
+        to.call("");
+        return;
+    }
+    function retHandsBack(address t) public {
+        helper(t);
+        b = 2;
+    }
+    function helper(address t) internal { t.call(""); return; }
+    function revHandsBack(address t) public {
+        revHelper(t);
+        b = 3;
+    }
+    function revHelper(address t) internal { t.call(""); revert("x"); }
+}
+`);
+  const r = run(path.join(sb.dir, 'term.sol'));
+  assert(r.code === 0, `term: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  // Fixture line 1 blank: modifier-post a=1 (9), retHandsBack b=2 (17).
+  // revHandsBack b=3 (22) is unreachable across a reverting callee.
+  const lines = hits.map((h) => h.location.startLine).sort((x, y) => x - y);
+  assert(lines.join(',') === '9,17', `term: expected 9,17 got ${lines}`);
+  // Modifier suffix runs after the body's early return (EVM semantics).
+  const post = hits.find((h) => h.location.startLine === 9);
+  assert(post.evidence.entryPoints[0].name === 'bodyReturns',
+    'term: modifier suffix reachable after body return');
+  assert(post.evidence.interaction.location.startLine === 12,
+    'term: suffix write witnessed by pre-return body interaction');
+  // A normal `return` in a callee still hands effects back to the caller.
+  const rb = hits.find((h) => h.location.startLine === 17);
+  assert(rb.evidence.interaction.callChain.map((c) => c.name).join('->') ===
+    'retHandsBack->helper', 'term: callee normal return hands effects back');
+  sb.remove();
+}
+
+function testStateMultipleEntries() {
+  const sb = makeSandbox();
+  sb.write('multi.sol', `
+pragma solidity ^0.8.0;
+contract Base {
+    uint256 s;
+    function core(address to) internal { to.call(""); s = 1; }
+}
+contract Mid is Base {
+    function viaA(address to) public { core(to); }
+    function viaB(address to) external { core(to); }
+}
+`);
+  const r = run(path.join(sb.dir, 'multi.sol'));
+  assert(r.code === 0, `multi: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  // One write source position -> exactly one finding across inheritance views.
+  assert(hits.length === 1, `multi: single finding for one write got ${hits.length}`);
+  const f = hits[0];
+  const names = f.evidence.entryPoints.map((e) => e.name).sort();
+  assert(names.join(',') === 'viaA,viaB', `multi: both entries collected got ${names}`);
+  assert(f.evidence.callChain.map((c) => c.name).join('->') === 'viaA->core',
+    'multi: shortest write chain is primary callChain');
+  assert(f.evidence.interaction.callChain.map((c) => c.name).join('->') === 'viaA->core',
+    'multi: interaction chain reaches the shared helper');
+  sb.remove();
+}
+
 function testEmptyAndInterfaceOnly() {
   const sb = makeSandbox();
   sb.write('i.sol', `
@@ -466,6 +742,12 @@ const tests = [
   testDelegatecall,
   testUncheckedCallVariants,
   testStateUpdate,
+  testStateRelayChains,
+  testStateBranchOrdering,
+  testStateWitnessDepthAndEntries,
+  testStateFreeFnAndCtorChain,
+  testStateTerminationAndModifiers,
+  testStateMultipleEntries,
   testReachabilityChain,
   testInheritanceOverride,
   testConstructorEntry,

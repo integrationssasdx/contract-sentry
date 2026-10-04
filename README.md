@@ -59,13 +59,37 @@ node bin/contract-sentry.js audit <path>
 - `reachable=false` 时 `evidence.entryPoints` 与 `evidence.callChain` 均为
   空数组。
 
+`STATE_UPDATE_AFTER_CALL` 的 `evidence` 额外包含 `interaction`：
+
+```json
+"interaction": {
+  "location": { "file": "contracts/Wallet.sol", "startLine": 20,
+                "startColumn": 9, "endLine": 20, "endColumn": 16 },
+  "callChain": [ { "file": "...", "contract": "Wallet",
+                   "name": "withdraw", "kind": "function" } ]
+}
+```
+
+- `interaction.location` 覆盖见证“先交互、后写状态”这一顺序的外部交互
+  （低级 `call`/`staticcall`/`send`/`transfer`、合约类型成员调用、
+  `new C(...)`）；`callChain` 是入口到该交互所在函数的最短链。
+- 顺序按控制流在同一路径上判定：`if`/`else`、循环、`try/catch`、
+  `return` 的互斥分支不会跨分支拼接；循环较早迭代的交互可为较后迭代
+  的写入作见证。判定沿继承展开后的内部调用、自由函数、构造函数链与
+  modifier 进行，调用者先交互/被调者后写入与被调者先交互/调用者后写入
+  两个方向都识别。
+- 一个写入存在多个见证交互时，取交互与写入之间函数层数最少者；层数
+  相同按入口顺序、再按交互位置取第一个。
+- `reachable=false` 时 `entryPoints`、`callChain`、`interaction.callChain`
+  均为空数组，但 `interaction.location` 仍保留。
+
 ### 规则
 
 | ruleId | severity | 含义 |
 | --- | --- | --- |
 | `DELEGATECALL_UNTRUSTED_TARGET` | high | `delegatecall` 的目标受函数参数、calldata、`msg.sender`、`tx.origin` 或可控存储值影响 |
 | `UNCHECKED_EXTERNAL_CALL` | medium | `call`、`staticcall`、`send`、`transfer` 的结果未在同函数后续控制流中检查 |
-| `STATE_UPDATE_AFTER_CALL` | high | 公开入口在外部调用或转账之后写入重入敏感状态 |
+| `STATE_UPDATE_AFTER_CALL` | high | 公开入口可达的同一路径上，外部调用或转账先于重入敏感状态写入（跨内部调用、自由函数、构造函数链、modifier 判定） |
 
 ### 入口与可达性
 
