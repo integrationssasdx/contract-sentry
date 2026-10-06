@@ -90,6 +90,15 @@ node bin/contract-sentry.js audit <path>
 | `DELEGATECALL_UNTRUSTED_TARGET` | high | `delegatecall` 的目标受函数参数、calldata、`msg.sender`、`tx.origin` 或可控存储值影响 |
 | `UNCHECKED_EXTERNAL_CALL` | medium | `call`、`staticcall`、`send`、`transfer` 的结果未在同函数后续控制流中检查 |
 | `STATE_UPDATE_AFTER_CALL` | high | 公开入口可达的同一路径上，外部调用或转账先于重入敏感状态写入（跨内部调用、自由函数、构造函数链、modifier 判定） |
+| `SELFDESTRUCT_UNTRUSTED_BENEFICIARY` | high | `selfdestruct(beneficiary)`（兼容旧写法 `suicide(beneficiary)`）的销毁受益人受外部因素影响 |
+
+`SELFDESTRUCT_UNTRUSTED_BENEFICIARY` 在受益人来自下列来源时产生 finding：
+函数参数、`msg.sender`、`tx.origin`、`msg.data` 或 calldata 解码
+（`abi.decode(...)`）、非 `constant` 且非 `immutable` 的状态值，以及经局部
+变量、赋值或中间计算传递这些来源的表达式。地址字面量、`constant`、
+`immutable` 以及不含上述来源的纯计算不产生 finding。`location` 覆盖
+`selfdestruct`/`suicide` 关键字到右括号的完整调用；经继承展开、modifier
+内联或内部调用定位时仍指向原操作位置。同一销毁操作只输出一个 finding。
 
 ### 入口与可达性
 
@@ -117,7 +126,7 @@ node bin/contract-sentry.js audit <path>
 npm test
 ```
 
-零依赖的子进程级测试，覆盖三条规则、可达性/继承/构造函数/修饰器、
+零依赖的子进程级测试，覆盖四条规则、可达性/继承/构造函数/修饰器、
 目录递归以及全部错误退出码。
 
 ## 约定

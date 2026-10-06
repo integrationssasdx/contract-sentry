@@ -5,11 +5,13 @@ export const RULES = {
   DELEGATECALL_UNTRUSTED_TARGET: { severity: 'high' },
   UNCHECKED_EXTERNAL_CALL: { severity: 'medium' },
   STATE_UPDATE_AFTER_CALL: { severity: 'high' },
+  SELFDESTRUCT_UNTRUSTED_BENEFICIARY: { severity: 'high' },
 };
 
 const LOW_LEVEL_CALLS = new Set(['call', 'staticcall', 'send', 'transfer']);
 const DELEGATE_CALLS = new Set(['delegatecall']);
 const ALL_LOW_LEVEL = new Set([...LOW_LEVEL_CALLS, ...DELEGATE_CALLS]);
+const SELFDESTRUCT_CALLS = new Set(['selfdestruct', 'suicide']);
 const BUILTIN_CALLS = new Set([
   'require', 'assert', 'revert', 'keccak256', 'sha256', 'ripemd160',
   'ecrecover', 'addmod', 'mulmod', 'blockhash', 'selfdestruct', 'suicide',
@@ -501,22 +503,30 @@ function computeReachability(view) {
 
 // ---- rule 1: tainted delegatecall target -----------------------------------
 
-function buildTaint(view, fnNode) {
+// `opts.decode` additionally treats every `abi.decode(...)` (calldata
+// decoding) as a tainted source, as required by the selfdestruct rule.
+function buildTaint(view, fnNode, opts = {}) {
   const tainted = new Set((fnNode.params || []).map((p) => p.name).filter(Boolean));
 
   const stateVarControllable = (name) => {
-    // Any mutable storage value feeding a delegatecall target is treated as
+    // Any mutable storage value feeding a sensitive sink is treated as
     // attacker-influenceable ("可控存储值"); constants/immutables are fixed.
     const sv = view.stateVars.get(name);
     if (!sv) return false;
     return !sv.node.isConstant && !sv.node.isImmutable;
   };
 
+  const isDecodeCall = (n) =>
+    !!opts.decode && n.kind === 'call' && n.callee &&
+    n.callee.kind === 'member' && n.callee.object.kind === 'ident' &&
+    n.callee.object.name === 'abi' && n.callee.property === 'decode';
+
   const isTaintedExpr = (expr) => {
     if (!expr) return false;
     let bad = false;
     walkExpr(expr, (n) => {
       if (bad) return;
+      if (isDecodeCall(n)) { bad = true; return; }
       if (n.kind === 'ident') {
         if (tainted.has(n.name) || stateVarControllable(n.name)) bad = true;
       } else if (n.kind === 'member' && n.object.kind === 'ident') {
@@ -587,6 +597,49 @@ function runDelegatecallRule(view, desc, wrapped) {
             ruleId: 'DELEGATECALL_UNTRUSTED_TARGET',
             origin: o,
             location: operationSpan(n),
+          });
+        }
+      });
+    }
+  });
+  return findings;
+}
+
+// ---- rule 4: selfdestruct with untrusted beneficiary ------------------------
+
+function isSelfdestructCall(n) {
+  return n && n.kind === 'call' && n.callee && n.callee.kind === 'ident' &&
+    SELFDESTRUCT_CALLS.has(n.callee.name);
+}
+
+function runSelfdestructRule(view, desc, wrapped) {
+  const findings = [];
+  // As with the delegatecall rule, taint scopes follow origins: modifier
+  // bodies see their own parameters plus state/global sources.
+  const cache = new Map();
+  const taintFor = (origin) => {
+    const k = descKey(origin);
+    if (!cache.has(k)) {
+      // The beneficiary is attacker-influenceable through calldata decoding
+      // (abi.decode(...)) in addition to the shared taint sources.
+      cache.set(k, buildTaint(view, origin.node, { decode: true }));
+    }
+    return cache.get(k);
+  };
+  eachStatement(wrapped, (stmt, origin) => {
+    const o = origin || desc;
+    const { isTaintedExpr } = taintFor(o);
+    for (const expr of statementExpressions(stmt)) {
+      walkExpr(expr, (n) => {
+        if (!isSelfdestructCall(n)) return;
+        const beneficiary = (n.args || [])[0];
+        if (beneficiary && isTaintedExpr(beneficiary)) {
+          findings.push({
+            ruleId: 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY',
+            origin: o,
+            // Full call: `selfdestruct(beneficiary)` / `suicide(...)`,
+            // from the keyword through the closing parenthesis.
+            location: n.loc,
           });
         }
       });
@@ -1270,6 +1323,30 @@ function runStateEngine(view) {
 
 // ---- driver ----------------------------------------------------------------
 
+// Scan file-level free functions for the selfdestruct rule only, merging
+// into the shared accumulator. `reach` resolves contract entries that
+// statically reach the free function.
+function scanFreeFunctionsSelfdestruct(view, reach, acc) {
+  for (const ff of view.freeFunctions.values()) {
+    if (!ff.node || !ff.node.body) continue;
+    const wrapped = view.effectiveStatements(ff);
+    const reachMap = reach.get(descKey(ff)) || new Map();
+    for (const r of runSelfdestructRule(view, ff, wrapped)) {
+      const key = `${r.ruleId}:${r.origin.file}:${r.location.startOffset}:${r.location.endOffset}`;
+      let f = acc.get(key);
+      if (!f) {
+        f = { ruleId: r.ruleId, severity: RULES[r.ruleId].severity,
+          file: r.origin.file, location: r.location, detail: r, entries: new Map() };
+        acc.set(key, f);
+      }
+      for (const [ek, chain] of reachMap.entries()) {
+        const prior = f.entries.get(ek);
+        if (!prior || prior.chain.length > chain.length) f.entries.set(ek, { chain });
+      }
+    }
+  }
+}
+
 export function analyze(parsedFiles) {
   const registry = new Registry(parsedFiles);
   const views = registry.buildViews();
@@ -1286,6 +1363,7 @@ export function analyze(parsedFiles) {
       for (const r of [
         ...runDelegatecallRule(view, desc, wrapped),
         ...runUncheckedCallRule(view, desc, wrapped),
+        ...runSelfdestructRule(view, desc, wrapped),
       ]) {
         const key = `${r.ruleId}:${r.origin.file}:${r.location.startOffset}:${r.location.endOffset}`;
         let f = acc.get(key);
@@ -1304,6 +1382,11 @@ export function analyze(parsedFiles) {
         }
       }
     }
+
+    // Free functions have no per-contract body walk above; the selfdestruct
+    // rule (only — the baseline rules keep their existing scoping) scans
+    // them here, inheriting reachability from entries that call them.
+    scanFreeFunctionsSelfdestruct(view, reach, acc);
 
     // STATE_UPDATE_AFTER_CALL: one path-sensitive, cross-function walk per
     // view. Reachability of an ordered (interaction ... write) path is
@@ -1344,6 +1427,16 @@ export function analyze(parsedFiles) {
     }
   }
 
+  // A source unit containing only free functions builds no contract view;
+  // such a free function can never be reached from an on-chain entry, but
+  // its pattern is still reported (reachable=false) by the new rule.
+  if (views.length === 0 && registry.freeFunctions.size > 0) {
+    const bare = new View(
+      { file: null, contract: null, name: null, kind: 'contract', arity: 0 },
+      registry, [], new Map(), new Map(), new Map(), registry.freeFunctions, []);
+    scanFreeFunctionsSelfdestruct(bare, new Map(), acc);
+  }
+
   return finalize(acc);
 }
 
@@ -1381,6 +1474,8 @@ function finalize(acc) {
     let message;
     if (d.ruleId === 'DELEGATECALL_UNTRUSTED_TARGET') {
       message = 'delegatecall 的目标受函数参数、calldata、msg.sender、tx.origin 或可控存储值影响，可能执行攻击者指定的合约代码';
+    } else if (d.ruleId === 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY') {
+      message = 'selfdestruct/suicide 的销毁受益人受函数参数、msg.sender、tx.origin、msg.data/calldata 解码或可变存储值影响，剩余以太可能转入攻击者地址';
     } else if (d.ruleId === 'UNCHECKED_EXTERNAL_CALL') {
       message = `底层调用 ${d.prop} 的返回结果未在同函数后续控制流中检查，失败会被静默忽略`;
     } else {
