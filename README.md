@@ -90,6 +90,7 @@ node bin/contract-sentry.js audit <path>
 | `DELEGATECALL_UNTRUSTED_TARGET` | high | `delegatecall` 的目标受函数参数、calldata、`msg.sender`、`tx.origin` 或可控存储值影响 |
 | `UNCHECKED_EXTERNAL_CALL` | medium | `call`、`staticcall`、`send`、`transfer` 的结果未在同函数后续控制流中检查 |
 | `STATE_UPDATE_AFTER_CALL` | high | 公开入口可达的同一路径上，外部调用或转账先于重入敏感状态写入（跨内部调用、自由函数、构造函数链、modifier 判定） |
+| `SELFDESTRUCT_UNTRUSTED_BENEFICIARY` | high | `selfdestruct(beneficiary)`（含旧写法 `suicide(beneficiary)`）的受益人受函数参数、`msg.sender`、`tx.origin`、`msg.data`/calldata 解码或非 constant/immutable 状态值影响（可经局部变量、赋值、中间计算传递）；地址字面量、`constant`、`immutable` 及不含这些来源的计算不报。`location` 覆盖 `selfdestruct`/`suicide` 关键字到右括号的完整调用 |
 
 ### 入口与可达性
 
@@ -117,7 +118,7 @@ node bin/contract-sentry.js audit <path>
 npm test
 ```
 
-零依赖的子进程级测试，覆盖三条规则、可达性/继承/构造函数/修饰器、
+零依赖的子进程级测试，覆盖四条规则、可达性/继承/构造函数/修饰器、
 目录递归以及全部错误退出码。
 
 ## 约定

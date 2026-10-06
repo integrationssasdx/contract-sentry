@@ -737,7 +737,201 @@ library L { function g(address a) internal { a.call(""); } }
   sb.remove();
 }
 
+function testSelfdestruct() {
+  const sb = makeSandbox();
+  sb.write('sd.sol', `
+pragma solidity ^0.8.0;
+contract SD {
+    address constant FIXED = address(0x1);
+    address immutable imm;
+    address mutableOwner;
+    constructor(address _i) { imm = _i; }
+    function byParam(address payable b) external {
+        selfdestruct(b);
+    }
+    function bySender() external {
+        selfdestruct(payable(msg.sender));
+    }
+    function byOrigin() external {
+        suicide(payable(tx.origin));
+    }
+    function byState() external {
+        selfdestruct(payable(mutableOwner));
+    }
+    function byLocal(address x) external {
+        address t = x;
+        selfdestruct(payable(t));
+    }
+    function byMsgData() external {
+        address decoded = abi.decode(msg.data, (address));
+        selfdestruct(payable(decoded));
+    }
+    function fixedLit() external {
+        selfdestruct(payable(address(0x123)));
+    }
+    function fixedConst() external {
+        selfdestruct(payable(FIXED));
+    }
+    function fixedImm() external {
+        selfdestruct(payable(imm));
+    }
+    function cleanCompute() external {
+        uint256 y = 1;
+        selfdestruct(payable(address(uint160(y))));
+    }
+    function hidden(address payable b) internal {
+        selfdestruct(b);
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'sd.sol'));
+  assert(r.code === 0, `selfdestruct: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY');
+  const reachableHits = hits.filter((h) => h.reachable);
+  const unreachableHits = hits.filter((h) => !h.reachable);
+  // Fixture line 1 is blank: positives at 9,12,15,18,22,26; literal /
+  // constant / immutable / clean computation produce nothing.
+  const lines = reachableHits.map((h) => h.location.startLine).sort((a, b) => a - b);
+  assert(lines.join(',') === '9,12,15,18,22,26',
+    `selfdestruct: expected reachable lines 9,12,15,18,22,26 got ${lines}`);
+  for (const h of hits) {
+    assert(h.severity === 'high', 'selfdestruct: severity high');
+  }
+  assert(unreachableHits.length === 1 && unreachableHits[0].location.startLine === 42,
+    `selfdestruct: internal-only hidden() unreachable at line 42, got ${unreachableHits.map((h) => h.location.startLine)}`);
+  const unreach = unreachableHits[0];
+  if (unreach) {
+    assert(unreach.evidence.entryPoints.length === 0, 'selfdestruct: unreachable empty entryPoints');
+    assert(unreach.evidence.callChain.length === 0, 'selfdestruct: unreachable empty callChain');
+  }
+  // location covers the keyword through the closing parenthesis.
+  const first = hits.find((h) => h.location.startLine === 9);
+  assert(first.location.startColumn === 9 && first.location.endLine === 9 &&
+    first.location.endColumn === 9 + 'selfdestruct(b)'.length - 1,
+    `selfdestruct: location spans keyword to ')' got ${JSON.stringify(first.location)}`);
+  const sui = hits.find((h) => h.location.startLine === 15);
+  assert(sui.location.startColumn === 9 &&
+    sui.location.endColumn === 9 + 'suicide(payable(tx.origin))'.length - 1,
+    `selfdestruct: suicide location spans keyword to ')' got ${JSON.stringify(sui.location)}`);
+  for (const h of reachableHits) {
+    assert(h.evidence.entryPoints.length >= 1, 'selfdestruct: has entry point evidence');
+    assert(h.evidence.callChain.length >= 1, 'selfdestruct: has call chain evidence');
+  }
+  sb.remove();
+}
+
+function testSelfdestructInheritanceAndEntries() {
+  const sb = makeSandbox();
+  sb.write('sd2.sol', `
+pragma solidity ^0.8.0;
+contract Base {
+    function kill(address payable b) internal { selfdestruct(b); }
+    function viaA(address payable b) public { kill(b); }
+    function viaB(address payable b) external { kill(b); }
+}
+contract Child is Base {}
+`);
+  const r = run(path.join(sb.dir, 'sd2.sol'));
+  assert(r.code === 0, `selfdestruct-inh: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY');
+  // One destroy operation -> exactly one finding across inheritance views.
+  assert(hits.length === 1, `selfdestruct-inh: single finding got ${hits.length}`);
+  const f = hits[0];
+  assert(f.location.startLine === 4, `selfdestruct-inh: located at the operation, got ${f.location.startLine}`);
+  assert(f.reachable === true, 'selfdestruct-inh: reachable');
+  const names = f.evidence.entryPoints.map((e) => e.name);
+  assert(names.join(',') === 'viaA,viaB', `selfdestruct-inh: deduped entries in order got ${names}`);
+  assert(f.evidence.callChain.map((c) => c.name).join('->') === 'viaA->kill',
+    'selfdestruct-inh: shortest chain viaA->kill');
+  sb.remove();
+}
+
+function testSelfdestructModifierFreeCtor() {
+  const sb = makeSandbox();
+  sb.write('sd3.sol', `
+pragma solidity ^0.8.0;
+function freeKill(address payable b) { selfdestruct(b); }
+contract M {
+    modifier destroy(address payable b) {
+        _;
+        selfdestruct(b);
+    }
+    function go(address payable b) public destroy(b) {
+    }
+    function viaFree(address payable b) public {
+        freeKill(b);
+    }
+}
+contract P {
+    constructor(address payable b) { selfdestruct(b); }
+}
+contract C is P {
+    constructor(address payable b) P(b) {}
+}
+`);
+  const r = run(path.join(sb.dir, 'sd3.sol'));
+  assert(r.code === 0, `selfdestruct-mfc: exit 0 (got ${r.code} ${r.stdout})`);
+  const hits = rules(r.json.findings, 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY');
+  const byLine = Object.fromEntries(hits.map((h) => [h.location.startLine, h]));
+  // Fixture line 1 blank: free function (3), modifier body (7), base ctor (16).
+  assert(Object.keys(byLine).sort((x, y) => x - y).join(',') === '3,7,16',
+    `selfdestruct-mfc: findings at 3,7,16 got ${Object.keys(byLine)}`);
+
+  const free = byLine[3];
+  assert(free.reachable === true, 'selfdestruct-mfc: free function reachable');
+  assert(free.evidence.entryPoints.map((e) => e.name).join(',') === 'viaFree',
+    'selfdestruct-mfc: free function entry is viaFree');
+  const fc = free.evidence.callChain;
+  assert(fc.length === 2 && fc[0].name === 'viaFree' &&
+    fc[1].name === 'freeKill' && fc[1].contract === null,
+    'selfdestruct-mfc: chain viaFree -> freeKill (file-level)');
+
+  const mod = byLine[7];
+  assert(mod.reachable === true, 'selfdestruct-mfc: modifier reachable');
+  assert(mod.evidence.entryPoints.map((e) => e.name).join(',') === 'go',
+    'selfdestruct-mfc: modifier inlined into go');
+  assert(mod.evidence.callChain.map((c) => c.name).join('->') === 'go',
+    'selfdestruct-mfc: modifier chain is the enclosing function');
+
+  const ctor = byLine[16];
+  assert(ctor.reachable === true, 'selfdestruct-mfc: constructor reachable');
+  assert(ctor.evidence.entryPoints[0].kind === 'constructor',
+    'selfdestruct-mfc: constructor entry kind');
+  sb.remove();
+}
+
+function testSelfdestructKeepsOtherRules() {
+  const sb = makeSandbox();
+  sb.write('sd4.sol', `
+pragma solidity ^0.8.0;
+contract Mix {
+    mapping(address => uint256) bal;
+    function f(address to, address payable b) public {
+        to.call("");
+        bal[msg.sender] = 0;
+        selfdestruct(b);
+    }
+}
+`);
+  const r = run(path.join(sb.dir, 'sd4.sol'));
+  assert(r.code === 0, `selfdestruct-mix: exit 0 (got ${r.code} ${r.stdout})`);
+  const sd = rules(r.json.findings, 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY');
+  assert(sd.length === 1 && sd[0].location.startLine === 8,
+    `selfdestruct-mix: one selfdestruct finding at line 8 got ${sd.map((h) => h.location.startLine)}`);
+  const state = rules(r.json.findings, 'STATE_UPDATE_AFTER_CALL');
+  assert(state.length === 1 && state[0].location.startLine === 7,
+    'selfdestruct-mix: existing state rule unaffected');
+  const unchecked = rules(r.json.findings, 'UNCHECKED_EXTERNAL_CALL');
+  assert(unchecked.length === 1 && unchecked[0].location.startLine === 6,
+    'selfdestruct-mix: existing unchecked rule unaffected');
+  sb.remove();
+}
+
 const tests = [
+  testSelfdestruct,
+  testSelfdestructInheritanceAndEntries,
+  testSelfdestructModifierFreeCtor,
+  testSelfdestructKeepsOtherRules,
   testCleanContract,
   testDelegatecall,
   testUncheckedCallVariants,

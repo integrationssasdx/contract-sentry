@@ -1,10 +1,11 @@
 // Core static analysis: registry/inheritance, entry points, reachability
-// via the intra-contract call graph, and the three audit rules.
+// via the intra-contract call graph, and the audit rules.
 
 export const RULES = {
   DELEGATECALL_UNTRUSTED_TARGET: { severity: 'high' },
   UNCHECKED_EXTERNAL_CALL: { severity: 'medium' },
   STATE_UPDATE_AFTER_CALL: { severity: 'high' },
+  SELFDESTRUCT_UNTRUSTED_BENEFICIARY: { severity: 'high' },
 };
 
 const LOW_LEVEL_CALLS = new Set(['call', 'staticcall', 'send', 'transfer']);
@@ -595,7 +596,57 @@ function runDelegatecallRule(view, desc, wrapped) {
   return findings;
 }
 
-// ---- rule 2: unchecked external call result --------------------------------
+// ---- rule 2: tainted selfdestruct beneficiary ------------------------------
+
+const SELFDESTRUCT_CALLS = new Set(['selfdestruct', 'suicide']);
+
+// Span covering the whole `selfdestruct(beneficiary)` call: from the
+// `selfdestruct`/`suicide` keyword through the closing parenthesis.
+function selfdestructSpan(callNode) {
+  const callee = callNode.callee;
+  return {
+    startOffset: callee.loc.startOffset,
+    endOffset: callNode.loc.endOffset,
+    startLine: callee.loc.startLine,
+    startColumn: callee.loc.startColumn,
+    endLine: callNode.loc.endLine,
+    endColumn: callNode.loc.endColumn,
+  };
+}
+
+function runSelfdestructRule(view, desc, wrapped) {
+  const findings = [];
+  // Same taint scopes as the delegatecall rule: each origin (function or
+  // modifier) seeds its own parameters plus state/global sources.
+  const cache = new Map();
+  const taintFor = (origin) => {
+    const k = descKey(origin);
+    if (!cache.has(k)) cache.set(k, buildTaint(view, origin.node));
+    return cache.get(k);
+  };
+  eachStatement(wrapped, (stmt, origin) => {
+    const o = origin || desc;
+    const { isTaintedExpr } = taintFor(o);
+    for (const expr of statementExpressions(stmt)) {
+      walkExpr(expr, (n) => {
+        if (n.kind !== 'call' || !n.callee || n.callee.kind !== 'ident' ||
+            !SELFDESTRUCT_CALLS.has(n.callee.name)) return;
+        const args = n.args || [];
+        if (args.length !== 1) return;
+        if (isTaintedExpr(args[0])) {
+          findings.push({
+            ruleId: 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY',
+            origin: o,
+            location: selfdestructSpan(n),
+          });
+        }
+      });
+    }
+  });
+  return findings;
+}
+
+// ---- rule 3: unchecked external call result --------------------------------
 
 function isRevertCall(n) {
   return n.kind === 'call' && n.callee.kind === 'ident' &&
@@ -787,7 +838,7 @@ function varChecked(stmt, name) {
   return found;
 }
 
-// ---- rule 3: state update after external interaction -----------------------
+// ---- rule 4: state update after external interaction -----------------------
 //
 // Path-sensitive, cross-function, built on BOUNDED PROCEDURAL INLINING:
 // the engine starts once at every method as a root frame and, walking in
@@ -1278,6 +1329,24 @@ export function analyze(parsedFiles) {
   for (const view of views) {
     const reach = computeReachability(view);
 
+    const absorb = (r, reachMap) => {
+      const key = `${r.ruleId}:${r.origin.file}:${r.location.startOffset}:${r.location.endOffset}`;
+      let f = acc.get(key);
+      if (!f) {
+        f = { ruleId: r.ruleId, severity: RULES[r.ruleId].severity,
+          file: r.origin.file, location: r.location, detail: r, entries: new Map() };
+        acc.set(key, f);
+      }
+      // Modifier-originated findings inherit the reachability of the
+      // enclosing method (modifier code is inlined into it).
+      const effectiveReach = (r.origin.kind === 'modifier') ? reachMap :
+        (reach.get(descKey(r.origin)) || reachMap);
+      for (const [ek, chain] of effectiveReach.entries()) {
+        const prior = f.entries.get(ek);
+        if (!prior || prior.chain.length > chain.length) f.entries.set(ek, { chain });
+      }
+    };
+
     for (const desc of view.methods.values()) {
       if (!desc.node || !desc.node.body) continue;
       const wrapped = view.effectiveStatements(desc);
@@ -1285,23 +1354,21 @@ export function analyze(parsedFiles) {
 
       for (const r of [
         ...runDelegatecallRule(view, desc, wrapped),
+        ...runSelfdestructRule(view, desc, wrapped),
         ...runUncheckedCallRule(view, desc, wrapped),
       ]) {
-        const key = `${r.ruleId}:${r.origin.file}:${r.location.startOffset}:${r.location.endOffset}`;
-        let f = acc.get(key);
-        if (!f) {
-          f = { ruleId: r.ruleId, severity: RULES[r.ruleId].severity,
-            file: r.origin.file, location: r.location, detail: r, entries: new Map() };
-          acc.set(key, f);
-        }
-        // Modifier-originated findings inherit the reachability of the
-        // enclosing method (modifier code is inlined into it).
-        const effectiveReach = (r.origin.kind === 'modifier') ? reachMap :
-          (reach.get(descKey(r.origin)) || reachMap);
-        for (const [ek, chain] of effectiveReach.entries()) {
-          const prior = f.entries.get(ek);
-          if (!prior || prior.chain.length > chain.length) f.entries.set(ek, { chain });
-        }
+        absorb(r, reachMap);
+      }
+    }
+
+    // File-level (free) functions are scanned for the selfdestruct rule as
+    // well: an entry may reach a destroy operation through one.
+    for (const desc of view.freeFunctions.values()) {
+      if (!desc.node || !desc.node.body) continue;
+      const wrapped = view.effectiveStatements(desc);
+      const reachMap = reach.get(descKey(desc)) || new Map();
+      for (const r of runSelfdestructRule(view, desc, wrapped)) {
+        absorb(r, reachMap);
       }
     }
 
@@ -1381,6 +1448,8 @@ function finalize(acc) {
     let message;
     if (d.ruleId === 'DELEGATECALL_UNTRUSTED_TARGET') {
       message = 'delegatecall 的目标受函数参数、calldata、msg.sender、tx.origin 或可控存储值影响，可能执行攻击者指定的合约代码';
+    } else if (d.ruleId === 'SELFDESTRUCT_UNTRUSTED_BENEFICIARY') {
+      message = 'selfdestruct/suicide 的受益人受函数参数、calldata、msg.sender、tx.origin 或可控存储值影响，合约销毁时资金可能流向攻击者控制的地址';
     } else if (d.ruleId === 'UNCHECKED_EXTERNAL_CALL') {
       message = `底层调用 ${d.prop} 的返回结果未在同函数后续控制流中检查，失败会被静默忽略`;
     } else {
